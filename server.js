@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const FormData = require('form-data');
-const sharp = require('sharp'); // Библиотека для конвертации картинок
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -22,7 +21,7 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// Загрузка страниц в Telegram с конвертацией в JPEG
+// Загрузка страниц в Telegram как документ (без сжатия и без sharp)
 // ==========================================
 app.post('/api/upload-page', async (req, res) => {
     try {
@@ -32,29 +31,21 @@ app.post('/api/upload-page', async (req, res) => {
         }
 
         const botToken = process.env.TELEGRAM_BOT_TOKEN;
-        const channelId = process.env.TELEGRAM_CHANNEL_ID; // Здесь должен быть ID вашей группы/канала (например, -100...)
+        const channelId = process.env.TELEGRAM_CHANNEL_ID;
 
         if (!botToken || !channelId) {
             console.error('Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID на Render!');
             return res.status(500).json({ error: 'Сервер не настроен для работы с Telegram CDN' });
         }
 
-        // 1. Очищаем Base64 и переводим в Buffer
+        // Очищаем Base64 и переводим в Buffer
         const base64Content = imageBase64.replace(/^data:image\/\w+;base64,/, '');
-        const inputBuffer = Buffer.from(base64Content, 'base64');
+        const buffer = Buffer.from(base64Content, 'base64');
 
-        // 2. АВТОМАТИЧЕСКАЯ КОНВЕРТАЦИЯ В JPEG ЧЕРЕЗ SHARP (сохраняет максимальное качество без сжатия Telegram)
-        const processedBuffer = await sharp(inputBuffer)
-            .jpeg({ quality: 92 }) // Качество 92% — идеальный баланс между весом и четкостью текста манги
-            .toBuffer();
-
-        // Формируем имя файла с расширением .jpg
-        const cleanName = (fileName ? fileName.substring(0, fileName.lastIndexOf('.')) : 'page') + '.jpg';
-
-        // 3. Отправляем в Telegram КАК ДОКУМЕНТ (sendDocument), что гарантирует 100% сохранение оригинального качества
+        // Отправляем в Telegram как документ (Telegram гарантирует 0% сжатия для документов)
         const form = new FormData();
-        form.append('chat_id', channelId); // Отправка строго в указанную группу/канал
-        form.append('document', processedBuffer, { filename: cleanName });
+        form.append('chat_id', channelId); // Убедитесь, что здесь ID группы/канала (-100...)
+        form.append('document', buffer, { filename: fileName || `page_${Date.now()}.webp` });
 
         const tgRes = await axios.post(
             `https://api.telegram.org/bot${botToken}/sendDocument`,
@@ -89,7 +80,9 @@ app.post('/api/upload-page', async (req, res) => {
     }
 });
 
-// Остальные эндпоинты...
+// ==========================================
+// Остальные эндпоинты
+// ==========================================
 app.post('/api/profile/like', async (req, res) => {
     return res.json({ success: true, message: 'Лайк успешно зарегистрирован' });
 });
