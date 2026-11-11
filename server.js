@@ -21,7 +21,7 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// Загрузка страниц в Telegram как документ (без сжатия и без sharp)
+// Загрузка страниц в Telegram как чистый файл-документ
 // ==========================================
 app.post('/api/upload-page', async (req, res) => {
     try {
@@ -38,14 +38,23 @@ app.post('/api/upload-page', async (req, res) => {
             return res.status(500).json({ error: 'Сервер не настроен для работы с Telegram CDN' });
         }
 
-        // Очищаем Base64 и переводим в Buffer
+        // Очищаем Base64 префикс и переводим в Buffer
         const base64Content = imageBase64.replace(/^data:image\/\w+;base64,/, '');
         const buffer = Buffer.from(base64Content, 'base64');
 
-        // Отправляем в Telegram как документ (Telegram гарантирует 0% сжатия для документов)
+        // Генерируем чистое имя файла с расширением .jpg
+        const baseName = fileName ? fileName.substring(0, fileName.lastIndexOf('.')) : 'page';
+        const safeFileName = `${baseName || 'page'}_${Date.now()}.jpg`;
+
         const form = new FormData();
-        form.append('chat_id', channelId); // Убедитесь, что здесь ID группы/канала (-100...)
-        form.append('document', buffer, { filename: fileName || `page_${Date.now()}.webp` });
+        form.append('chat_id', channelId);
+        
+        // Передаем файл с явным указанием MIME-типа изображения, 
+        // чтобы Telegram не пытался интерпретировать его как стикер
+        form.append('document', buffer, { 
+            filename: safeFileName,
+            contentType: 'image/jpeg' 
+        });
 
         const tgRes = await axios.post(
             `https://api.telegram.org/bot${botToken}/sendDocument`,
@@ -64,7 +73,7 @@ app.post('/api/upload-page', async (req, res) => {
 
         const fileId = document.file_id;
 
-        // Получаем прямую публичную ссылку
+        // Получаем прямую публичную ссылку на файл
         const fileInfoRes = await axios.get(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
         const filePath = fileInfoRes.data.result.file_path;
         const publicUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
@@ -79,7 +88,6 @@ app.post('/api/upload-page', async (req, res) => {
         });
     }
 });
-
 // ==========================================
 // Остальные эндпоинты
 // ==========================================
