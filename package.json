@@ -1,14 +1,16 @@
 {
   "name": "mcity-backend",
   "version": "1.0.0",
-  "description": "Backend for MCity Manga",
+  "description": "MCity Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.6.0",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "pg": "^8.11.3"
+    "form-data": "^4.0.0",
+    "express": "^4.19.2"
   }
 }
