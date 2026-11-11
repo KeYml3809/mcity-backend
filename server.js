@@ -29,7 +29,7 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// 2. Telegram CDN Upload (Загрузка страниц в Telegram)
+// Telegram CDN Upload (Загрузка страниц как фото)
 // ==========================================
 app.post('/api/upload-page', async (req, res) => {
     try {
@@ -43,7 +43,7 @@ app.post('/api/upload-page', async (req, res) => {
 
         if (!botToken || !channelId) {
             console.error('Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID на Render!');
-            return res.status(500).json({ error: 'Сервер не настроен для работы с Telegram CDN (отсутствуют переменные окружения)' });
+            return res.status(500).json({ error: 'Сервер не настроен для работы с Telegram CDN' });
         }
 
         // Чистим Base64 префикс если он есть
@@ -53,31 +53,34 @@ app.post('/api/upload-page', async (req, res) => {
         // Подготавливаем multipart/form-data для Telegram API
         const form = new FormData();
         form.append('chat_id', channelId);
-        form.append('document', buffer, { filename: fileName || `page_${Date.now()}.webp` });
+        // ВАЖНО: используем 'photo' вместо 'document', чтобы Telegram не делал из файлов стикеры
+        form.append('photo', buffer, { filename: fileName || `page_${Date.now()}.jpg` });
 
-        // Отправляем файл в Telegram-канал
+        // Отправляем фото в Telegram-канал методом sendPhoto
         const tgRes = await axios.post(
-            `https://api.telegram.org/bot${botToken}/sendDocument`,
+            `https://api.telegram.org/bot${botToken}/sendPhoto`,
             form,
             { headers: form.getHeaders() }
         );
 
         if (!tgRes.data.ok) {
-            throw new Error('Telegram Bot API вернул ошибку при сохранении документа');
+            throw new Error('Telegram Bot API вернул ошибку при сохранении фото');
         }
 
-        const document = tgRes.data.result.document || (tgRes.data.result.photo && tgRes.data.result.photo.slice(-1)[0]);
-        if (!document) {
-            throw new Error('Не удалось получить file_id от Telegram');
+        // У отправленного фото массив размеров photo лежит в ответе, берем самое последнее (самое качественное)
+        const photos = tgRes.data.result.photo;
+        if (!photos || photos.length === 0) {
+            throw new Error('Не удалось получить информацию о фото от Telegram');
         }
-
-        const fileId = document.file_id;
+        
+        const bestPhoto = photos[photos.length - 1];
+        const fileId = bestPhoto.file_id;
 
         // Запрашиваем путь к файлу у Telegram
         const fileInfoRes = await axios.get(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
         const filePath = fileInfoRes.data.result.file_path;
 
-        // Формируем прямую публичную ссылку на документ
+        // Формируем прямую публичную ссылку на картинку
         const publicUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
 
         return res.json({ url: publicUrl });
