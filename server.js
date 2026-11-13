@@ -113,11 +113,18 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// Обновленный эндпоинт: поддерживает сохранение fileId для работы через прокси без сгорания ссылок
 app.post('/api/upload-page', async (req, res) => {
-  const { imageBase64 } = req.body;
-  if (!imageBase64) {
-    return res.status(400).json({ error: 'Изображение не передано' });
+  const { imageBase64, fileId } = req.body;
+  
+  if (fileId) {
+    return res.json({ success: true, url: fileId });
   }
+
+  if (!imageBase64) {
+    return res.status(400).json({ error: 'Изображение или fileId не переданы' });
+  }
+  
   res.json({ success: true, url: imageBase64 });
 });
 
