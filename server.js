@@ -93,11 +93,23 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, likes_count as "likesCount", public_id as "publicId" FROM users`
+      `SELECT id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId", COALESCE(cards, '[]'::jsonb) as cards FROM users`
     );
-    res.json(result.rows);
+    const rows = result.rows.map(r => ({
+      ...r,
+      cards: Array.isArray(r.cards) ? r.cards : [],
+      cardsCount: Array.isArray(r.cards) ? r.cards.length : 0
+    }));
+    res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    try {
+      const fallback = await pool.query(
+        `SELECT id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId" FROM users`
+      );
+      res.json(fallback.rows.map(r => ({ ...r, cards: [], cardsCount: 0 })));
+    } catch (e2) {
+      res.status(500).json({ error: e2.message });
+    }
   }
 });
 
@@ -110,17 +122,23 @@ app.post('/api/upload-page', async (req, res) => {
 });
 
 app.patch('/api/profile', async (req, res) => {
-  let { userId, avatarUrl, bannerUrl, nickname } = req.body;
+  let { userId, avatarUrl, bannerUrl, nickname, cards } = req.body;
   try {
     const realUserId = await resolveUserId(pool, userId);
+    if (cards !== undefined) {
+      try {
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cards JSONB DEFAULT '[]'::jsonb`);
+      } catch (e) {}
+    }
     const result = await pool.query(
       `UPDATE users 
        SET avatar_url = COALESCE($1, avatar_url), 
            banner_url = COALESCE($2, banner_url),
-           username = COALESCE($3, username)
-       WHERE id = $4 
-       RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, likes_count as "likesCount", public_id as "publicId"`,
-      [avatarUrl, bannerUrl, nickname, realUserId]
+           username = COALESCE($3, username),
+           cards = COALESCE($4::jsonb, cards)
+       WHERE id = $5 
+       RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId", COALESCE(cards, '[]'::jsonb) as cards`,
+      [avatarUrl, bannerUrl, nickname, cards ? JSON.stringify(cards) : null, realUserId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Пользователь не найден' });
     res.json({ success: true, user: result.rows[0] });
@@ -133,32 +151,29 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   let { fromUserId } = req.body;
   let { targetUserId } = req.params;
 
+  if (!fromUserId) {
+    return res.status(401).json({ error: 'Авторизуйтесь, чтобы поставить лайк' });
+  }
+
   try {
     const realFromId = await resolveUserId(pool, fromUserId);
     const realTargetId = await resolveUserId(pool, targetUserId);
 
-    if (realFromId === realTargetId) {
+    if (String(realFromId) === String(realTargetId)) {
       return res.status(400).json({ error: 'Нельзя ставить лайк самому себе' });
     }
 
-    const lastLikeRes = await pool.query(
-      `SELECT created_at FROM profile_likes_log 
+    const existingLikeRes = await pool.query(
+      `SELECT 1 FROM profile_likes_log 
        WHERE from_user_id = $1 AND to_user_id = $2 
-       ORDER BY created_at DESC LIMIT 1`,
+       LIMIT 1`,
       [realFromId, realTargetId]
     );
 
-    if (lastLikeRes.rows.length > 0) {
-      const lastLikeTime = new Date(lastLikeRes.rows[0].created_at).getTime();
-      const threeHoursInMs = 3 * 60 * 60 * 1000;
-      const timePassed = Date.now() - lastLikeTime;
-
-      if (timePassed < threeHoursInMs) {
-        const remainingMinutes = Math.ceil((threeHoursInMs - timePassed) / (1000 * 60));
-        return res.status(429).json({ 
-          error: `Повторный лайк можно поставить через ${remainingMinutes} мин.` 
-        });
-      }
+    if (existingLikeRes.rows.length > 0) {
+      return res.status(409).json({ 
+        error: 'Вы уже поставили лайк этому пользователю. Повторный лайк невозможен.' 
+      });
     }
 
     await pool.query('BEGIN');
@@ -166,13 +181,14 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
       `INSERT INTO profile_likes_log (from_user_id, to_user_id) VALUES ($1, $2)`,
       [realFromId, realTargetId]
     );
-    await pool.query(
-      `UPDATE users SET likes_count = likes_count + 1 WHERE id = $1`,
+    const updatedUserRes = await pool.query(
+      `UPDATE users SET likes_count = COALESCE(likes_count, 0) + 1 WHERE id = $1 RETURNING likes_count`,
       [realTargetId]
     );
     await pool.query('COMMIT');
 
-    res.json({ success: true, message: 'Лайк успешно поставлен!' });
+    const newLikesCount = updatedUserRes.rows[0]?.likes_count || 1;
+    res.json({ success: true, message: 'Лайк успешно поставлен!', likesCount: newLikesCount });
   } catch (err) {
     await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
