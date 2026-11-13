@@ -17,7 +17,6 @@ function hashPassword(password) {
   return crypto.createHash('sha256').update(password + salt).digest('hex');
 }
 
-// Вспомогательная функция для конвертации publicId ("MC-XXXXXX") в реальный id базы данных
 async function resolveUserId(clientOrPool, val) {
   if (!val) return null;
   const strVal = String(val);
@@ -30,7 +29,6 @@ async function resolveUserId(clientOrPool, val) {
   return val;
 }
 
-// 1. РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
 app.post('/api/register', async (req, res) => {
   const { email, password, nickname } = req.body;
   if (!email || !password || !nickname) {
@@ -55,7 +53,6 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 2. ВХОД В АККАУНТ
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -93,7 +90,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// 3. ПОЛУЧЕНИЕ СПИСКА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
 app.get('/api/users', async (req, res) => {
   try {
     const result = await pool.query(
@@ -105,7 +101,6 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// 4. ЗАГРУЗКА ИЗОБРАЖЕНИЙ
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) {
@@ -114,7 +109,6 @@ app.post('/api/upload-page', async (req, res) => {
   res.json({ success: true, url: imageBase64 });
 });
 
-// 5. ОБНОВЛЕНИЕ ПРОФИЛЯ
 app.patch('/api/profile', async (req, res) => {
   let { userId, avatarUrl, bannerUrl, nickname } = req.body;
   try {
@@ -135,7 +129,6 @@ app.patch('/api/profile', async (req, res) => {
   }
 });
 
-// 6. ЛАЙК ПРОФИЛЯ С КУЛДАУНОМ 3 ЧАСА
 app.post('/api/profile/:targetUserId/like', async (req, res) => {
   let { fromUserId } = req.body;
   let { targetUserId } = req.params;
@@ -186,7 +179,6 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
-// 7. ДРОП КОЛЛЕКЦИОННОЙ КАРТОЧКИ
 app.post('/api/cards/claim-drop', async (req, res) => {
   let { userId } = req.body;
 
@@ -212,7 +204,7 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     else if (rand > 97.0) selectedRarity = 'S';
     else if (rand > 90.0) selectedRarity = 'A';
     else if (rand > 75.0) selectedRarity = 'B';
-    else if (rand > 50.0) selectedRarity = 'C';
+    else if (rand > 50.0) selectedRolarity = 'C';
 
     const cardRes = await pool.query(
       `SELECT * FROM cards WHERE rarity = $1 ORDER BY RANDOM() LIMIT 1`,
@@ -246,3 +238,11 @@ app.post('/api/cards/claim-drop', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+'''
+
+zip_filename = "mcity-manga-files.zip"
+with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    zipf.writestr("index.html", index_content)
+    zipf.writester("server.js", server_content)
+
+print(f"Archive created successfully: {zip_filename}")
