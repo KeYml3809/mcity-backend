@@ -151,29 +151,32 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   let { fromUserId } = req.body;
   let { targetUserId } = req.params;
 
-  if (!fromUserId) {
-    return res.status(401).json({ error: 'Авторизуйтесь, чтобы поставить лайк' });
-  }
-
   try {
     const realFromId = await resolveUserId(pool, fromUserId);
     const realTargetId = await resolveUserId(pool, targetUserId);
 
-    if (String(realFromId) === String(realTargetId)) {
+    if (realFromId === realTargetId) {
       return res.status(400).json({ error: 'Нельзя ставить лайк самому себе' });
     }
 
-    const existingLikeRes = await pool.query(
-      `SELECT 1 FROM profile_likes_log 
+    const lastLikeRes = await pool.query(
+      `SELECT created_at FROM profile_likes_log 
        WHERE from_user_id = $1 AND to_user_id = $2 
-       LIMIT 1`,
+       ORDER BY created_at DESC LIMIT 1`,
       [realFromId, realTargetId]
     );
 
-    if (existingLikeRes.rows.length > 0) {
-      return res.status(409).json({ 
-        error: 'Вы уже поставили лайк этому пользователю. Повторный лайк невозможен.' 
-      });
+    if (lastLikeRes.rows.length > 0) {
+      const lastLikeTime = new Date(lastLikeRes.rows[0].created_at).getTime();
+      const threeHoursInMs = 3 * 60 * 60 * 1000;
+      const timePassed = Date.now() - lastLikeTime;
+
+      if (timePassed < threeHoursInMs) {
+        const remainingMinutes = Math.ceil((threeHoursInMs - timePassed) / (1000 * 60));
+        return res.status(429).json({ 
+          error: `Повторный лайк можно поставить через ${remainingMinutes} мин.` 
+        });
+      }
     }
 
     await pool.query('BEGIN');
@@ -181,14 +184,13 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
       `INSERT INTO profile_likes_log (from_user_id, to_user_id) VALUES ($1, $2)`,
       [realFromId, realTargetId]
     );
-    const updatedUserRes = await pool.query(
-      `UPDATE users SET likes_count = COALESCE(likes_count, 0) + 1 WHERE id = $1 RETURNING likes_count`,
+    await pool.query(
+      `UPDATE users SET likes_count = likes_count + 1 WHERE id = $1`,
       [realTargetId]
     );
     await pool.query('COMMIT');
 
-    const newLikesCount = updatedUserRes.rows[0]?.likes_count || 1;
-    res.json({ success: true, message: 'Лайк успешно поставлен!', likesCount: newLikesCount });
+    res.json({ success: true, message: 'Лайк успешно поставлен!' });
   } catch (err) {
     await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
