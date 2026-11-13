@@ -228,7 +228,3 @@ app.post('/api/cards/claim-drop', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
-catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-};
