@@ -5,14 +5,13 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Увеличенный лимит для передачи изображений в base64
+app.use(express.json({ limit: '50mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Хеширование паролей с использованием встроенного модуля crypto
 function hashPassword(password) {
   const salt = 'mcity_secure_salt_key';
   return crypto.createHash('sha256').update(password + salt).digest('hex');
@@ -27,11 +26,12 @@ app.post('/api/register', async (req, res) => {
 
   try {
     const passwordHash = hashPassword(password);
+    const publicId = 'MC-' + Math.floor(100000 + Math.random() * 900000);
     const result = await pool.query(
-      `INSERT INTO users (username, email, password_hash) 
-       VALUES ($1, $2, $3) 
-       RETURNING id, username as nickname, email`,
-      [nickname.trim(), email.trim().toLowerCase(), passwordHash]
+      `INSERT INTO users (username, email, password_hash, public_id) 
+       VALUES ($1, $2, $3, $4) 
+       RETURNING id, username as nickname, email, public_id as "publicId"`,
+      [nickname.trim(), email.trim().toLowerCase(), passwordHash, publicId]
     );
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
@@ -52,7 +52,7 @@ app.post('/api/login', async (req, res) => {
   try {
     const passwordHash = hashPassword(password);
     const result = await pool.query(
-      `SELECT id, username as nickname, email, avatar_url, banner_url, likes_count 
+      `SELECT id, username as nickname, email, avatar_url, banner_url, likes_count, public_id 
        FROM users 
        WHERE email = $1 AND password_hash = $2`,
       [email.trim().toLowerCase(), passwordHash]
@@ -69,6 +69,7 @@ app.post('/api/login', async (req, res) => {
         id: user.id,
         email: user.email,
         nickname: user.nickname,
+        publicId: user.public_id || ('MC-' + Math.abs(parseInt(user.id.replace(/-/g,''), 16)) % 900000 + 100000),
         avatar: user.avatar_url || '',
         banner: user.banner_url || '',
         likesCount: user.likes_count || 0
@@ -79,11 +80,11 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// 3. ПОЛУЧЕНИЕ СПИСКА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ (для поиска)
+// 3. ПОЛУЧЕНИЕ СПИСКА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
 app.get('/api/users', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, likes_count as "likesCount" FROM users`
+      `SELECT id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, likes_count as "likesCount", public_id as "publicId" FROM users`
     );
     res.json(result.rows);
   } catch (err) {
@@ -91,13 +92,12 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// 4. ЗАГРУЗКА ИЗОБРАЖЕНИЙ (Аватаров, баннеров, страниц)
+// 4. ЗАГРУЗКА ИЗОБРАЖЕНИЙ
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) {
     return res.status(400).json({ error: 'Изображение не передано' });
   }
-  // Возвращаем base64 как надежный data-url для стабильной работы на Render без внешних хранилищ
   res.json({ success: true, url: imageBase64 });
 });
 
@@ -111,7 +111,7 @@ app.patch('/api/profile', async (req, res) => {
            banner_url = COALESCE($2, banner_url),
            username = COALESCE($3, username)
        WHERE id = $4 
-       RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, likes_count as "likesCount"`,
+       RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, likes_count as "likesCount", public_id as "publicId"`,
       [avatarUrl, bannerUrl, nickname, userId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Пользователь не найден' });
@@ -169,7 +169,7 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
-// 7. ДРОП КОЛЛЕКЦИОННОЙ КАРТОЧКИ (Таймер 10 минут)
+// 7. ДРОП КОЛЛЕКЦИОННОЙ КАРТОЧКИ
 app.post('/api/cards/claim-drop', async (req, res) => {
   const { userId } = req.body;
 
