@@ -113,19 +113,43 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Обновленный эндпоинт: поддерживает сохранение fileId для работы через прокси без сгорания ссылок
+// Загрузка изображений (страниц манги, аватаров, рамок) через Telegram-бота
 app.post('/api/upload-page', async (req, res) => {
-  const { imageBase64, fileId } = req.body;
-  
-  if (fileId) {
-    return res.json({ success: true, url: fileId });
+  const { imageBase64, fileName } = req.body;
+  if (!imageBase64) {
+    return res.status(400).json({ error: 'Изображение не передано' });
   }
 
-  if (!imageBase64) {
-    return res.status(400).json({ error: 'Изображение или fileId не переданы' });
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  // Если токен Telegram не настроен на сервере, возвращаем Base64 как резервный вариант
+  if (!botToken || !chatId) {
+    return res.json({ success: true, url: imageBase64 });
   }
-  
-  res.json({ success: true, url: imageBase64 });
+
+  try {
+    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const formData = new FormData();
+    formData.append('chat_id', chatId);
+    formData.append('document', new Blob([buffer]), fileName || 'page.jpg');
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+      method: 'POST',
+      body: formData
+    });
+    const tgData = await tgRes.json();
+
+    if (!tgData.ok) {
+      return res.status(500).json({ error: 'Ошибка Telegram: ' + tgData.description });
+    }
+
+    const fileId = tgData.result.document.file_id;
+    res.json({ success: true, url: fileId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.patch('/api/profile', async (req, res) => {
