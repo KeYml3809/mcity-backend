@@ -102,7 +102,7 @@ async function initDB() {
   }
 }
 
-// Вспомогательная функция хеширования паролей без сторонних зависимостей
+// Вспомогательные функции хеширования паролей без сторонних зависимостей
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -121,10 +121,10 @@ function verifyPassword(password, storedHash) {
 }
 
 // ==========================================
-// 1. АВТОРИЗАЦИЯ И РЕГИСТРАЦИЯ
+// 1. АВТОРИЗАЦИЯ И РЕГИСТРАЦИЯ (Поддержка обоих форматов URL)
 // ==========================================
 
-app.post('/api/auth/register', async (req, res) => {
+app.post(['/api/auth/register', '/api/register'], async (req, res) => {
   const { username, email, password } = req.body;
   if (!username || !email || !password) {
     return res.status(400).json({ error: 'Заполните все обязательные поля' });
@@ -151,7 +151,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post(['/api/auth/login', '/api/login'], async (req, res) => {
   const { email, username, password } = req.body;
   const loginIdentifier = (email || username || '').trim();
 
@@ -228,7 +228,7 @@ app.delete('/api/users/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/profile', async (req, res) => {
+app.patch(['/api/profile', '/api/users/profile'], async (req, res) => {
   const { userId, username, avatarUrl, bannerUrl } = req.body;
   try {
     const result = await pool.query(
@@ -440,7 +440,7 @@ app.post('/api/trades', async (req, res) => {
 
 app.post('/api/trades/:tradeId/respond', async (req, res) => {
   const { tradeId } = req.params;
-  const { action } = req.body; // 'accept' или 'reject'
+  const { action } = req.body;
 
   try {
     const tradeRes = await pool.query(`SELECT * FROM trades WHERE id = $1`, [tradeId]);
