@@ -204,7 +204,7 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     else if (rand > 97.0) selectedRarity = 'S';
     else if (rand > 90.0) selectedRarity = 'A';
     else if (rand > 75.0) selectedRarity = 'B';
-    else if (rand > 50.0) selectedRolarity = 'C';
+    else if (rand > 50.0) selectedRarity = 'C';
 
     const cardRes = await pool.query(
       `SELECT * FROM cards WHERE rarity = $1 ORDER BY RANDOM() LIMIT 1`,
@@ -238,11 +238,3 @@ app.post('/api/cards/claim-drop', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
-'''
-
-zip_filename = "mcity-manga-files.zip"
-with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-    zipf.writestr("index.html", index_content)
-    zipf.writester("server.js", server_content)
-
-print(f"Archive created successfully: {zip_filename}")
