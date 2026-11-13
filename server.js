@@ -1,126 +1,255 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { Pool } = require('pg');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
+// Подключение к PostgreSQL (Supabase Transaction Pooler порт 6543)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+// Автоматическая проверка и синхронизация схемы БД при запуске
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        public_id SERIAL,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        avatar_url TEXT DEFAULT '/avatars/default.png',
+        banner_url TEXT DEFAULT '/banners/default.png',
+        role VARCHAR(20) DEFAULT 'user',
+        likes_count INT DEFAULT 0,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id SERIAL;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS likes_count INT DEFAULT 0;`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS profile_likes_log (
+        id SERIAL PRIMARY KEY,
+        from_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        to_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      DO $$ BEGIN
+        CREATE TYPE card_rarity AS ENUM ('D', 'C', 'B', 'A', 'S', 'SS');
+      EXCEPTION
+        WHEN duplicate_object THEN null;
+      END $$;
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cards (
+        id SERIAL PRIMARY KEY,
+        public_id TEXT,
+        name VARCHAR(100) NOT NULL,
+        character_name VARCHAR(100) NOT NULL,
+        manga_title VARCHAR(150) NOT NULL,
+        image_url TEXT NOT NULL,
+        rarity card_rarity NOT NULL DEFAULT 'D',
+        drop_rate NUMERIC(5,2) NOT NULL DEFAULT 10.00
+      );
+    `);
+
+    await pool.query(`ALTER TABLE cards ADD COLUMN IF NOT EXISTS public_id TEXT;`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_cards (
+        id SERIAL PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        card_id INT REFERENCES cards(id) ON DELETE CASCADE,
+        obtained_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS card_drop_cooldowns (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        last_drop_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        sender_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        receiver_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        sender_user_card_id INT REFERENCES user_cards(id) ON DELETE CASCADE,
+        receiver_user_card_id INT REFERENCES user_cards(id) ON DELETE SET NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    console.log('✅ База данных успешно проверена и синхронизирована');
+  } catch (err) {
+    console.error('❌ Ошибка инициализации БД:', err.message);
+  }
+}
+
+// Вспомогательная функция хеширования паролей без сторонних зависимостей
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (!storedHash || !storedHash.includes(':')) {
+    return password === storedHash;
+  }
+  const [salt, key] = storedHash.split(':');
+  const hashBuffer = crypto.scryptSync(password, salt, 64);
+  const keyBuffer = Buffer.from(key, 'hex');
+  if (hashBuffer.length !== keyBuffer.length) return false;
+  return crypto.timingSafeEqual(hashBuffer, keyBuffer);
+}
+
 // ==========================================
-// 0. АВТОРИЗАЦИЯ И ПОЛЬЗОВАТЕЛИ
+// 1. АВТОРИЗАЦИЯ И РЕГИСТРАЦИЯ
 // ==========================================
 
-// Регистрация
-app.post('/api/register', async (req, res) => {
-  const { email, password, nickname } = req.body;
-  if (!email || !password || !nickname) {
-    return res.status(400).json({ error: 'Заполните все поля' });
+app.post('/api/auth/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: 'Заполните все обязательные поля' });
   }
 
   try {
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanNick = nickname.trim().replace(/^@+/, '');
-    const publicId = 'MC-' + Math.floor(100000 + Math.random() * 900000);
-
+    const passwordHash = hashPassword(password);
     const result = await pool.query(
-      `INSERT INTO users (username, email, password_hash, public_id) 
-       VALUES ($1, $2, $3, $4) 
-       RETURNING id, username as nickname, email, avatar_url, banner_url, public_id, role, likes_count`,
-      [cleanNick, cleanEmail, password, publicId]
+      `INSERT INTO users (username, email, password_hash)
+       VALUES ($1, $2, $3)
+       RETURNING id, public_id, username, email, avatar_url, banner_url, role, likes_count`,
+      [username.trim(), email.trim().toLowerCase(), passwordHash]
     );
 
-    res.json({ success: true, user: result.rows[0] });
+    const user = result.rows[0];
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    res.status(201).json({ success: true, token, user });
   } catch (err) {
+    console.error('Register error:', err);
     if (err.code === '23505') {
-      return res.status(400).json({ error: 'Пользователь с таким email или никнеймом уже существует' });
+      return res.status(409).json({ error: 'Пользователь с таким именем или email уже существует' });
     }
     res.status(500).json({ error: err.message });
   }
 });
 
-// Вход
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Введите email и пароль' });
+app.post('/api/auth/login', async (req, res) => {
+  const { email, username, password } = req.body;
+  const loginIdentifier = (email || username || '').trim();
+
+  if (!loginIdentifier || !password) {
+    return res.status(400).json({ error: 'Введите логин/email и пароль' });
   }
 
   try {
-    const cleanEmail = email.trim().toLowerCase();
     const result = await pool.query(
-      `SELECT id, username as nickname, email, password_hash, avatar_url, banner_url, public_id, role, likes_count 
-       FROM users WHERE email = $1`,
-      [cleanEmail]
+      `SELECT id, public_id, username, email, password_hash, avatar_url, banner_url, role, likes_count
+       FROM users
+       WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1)
+       LIMIT 1`,
+      [loginIdentifier]
     );
 
     if (result.rows.length === 0) {
-      return res.status(400).json({ error: 'Неверный email или пароль' });
+      return res.status(401).json({ error: 'Неверный логин или пароль' });
     }
 
     const user = result.rows[0];
-    if (user.password_hash !== password) {
-      return res.status(400).json({ error: 'Неверный email или пароль' });
+    const isValid = verifyPassword(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Неверный логин или пароль' });
     }
 
     delete user.password_hash;
-    res.json({ success: true, user });
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    res.json({ success: true, token, user });
   } catch (err) {
+    console.error('Login error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Получение списка всех пользователей (для поиска)
+// ==========================================
+// 2. ПОЛЬЗОВАТЕЛИ И ПРОФИЛИ (v17_2 + v18)
+// ==========================================
+
 app.get('/api/users', async (req, res) => {
+  const { search } = req.query;
   try {
-    const usersResult = await pool.query(
-      `SELECT id as userId, username as nickname, email, avatar_url as avatar, banner_url as banner, public_id as "publicId", likes_count as "likesCount" FROM users`
-    );
-    
-    const users = [];
-    for (let u of usersResult.rows) {
-      const cardsRes = await pool.query(
-        `SELECT c.id, c.name as title, c.rarity, c.manga_title as "mangaId", c.image_url as image 
-         FROM user_cards uc JOIN cards c ON uc.card_id = c.id WHERE uc.user_id = $1`,
-        [u.userId]
-      );
-      users.push({ ...u, cards: cardsRes.rows });
+    let query = `
+      SELECT id, public_id, username, email, avatar_url, banner_url, role, likes_count, created_at
+      FROM users
+    `;
+    const params = [];
+
+    if (search && search.trim() !== '') {
+      query += ` WHERE username ILIKE $1 OR CAST(public_id AS TEXT) = $2`;
+      params.push(`%${search.trim()}%`, search.trim());
     }
 
-    res.json(users);
+    query += ` ORDER BY created_at DESC LIMIT 100`;
+    const result = await pool.query(query, params);
+    res.json({ success: true, users: result.rows });
   } catch (err) {
+    console.error('Get users error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// 1. ОБНОВЛЕНИЕ ПРОФИЛЯ
-// ==========================================
+app.delete('/api/users/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(`DELETE FROM users WHERE id = $1 RETURNING id`, [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    res.json({ success: true, message: 'Пользователь удален' });
+  } catch (err) {
+    console.error('Delete user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.patch('/api/profile', async (req, res) => {
-  const { userId, avatarUrl, bannerUrl, nickname } = req.body;
+  const { userId, username, avatarUrl, bannerUrl } = req.body;
   try {
     const result = await pool.query(
-      `UPDATE users 
-       SET avatar_url = COALESCE($1, avatar_url), 
-           banner_url = COALESCE($2, banner_url),
-           username = COALESCE($3, username)
-       WHERE id = $4 RETURNING id, username as nickname, avatar_url, banner_url, public_id`,
-      [avatarUrl, bannerUrl, nickname, userId]
+      `UPDATE users
+       SET username = COALESCE($1, username),
+           avatar_url = COALESCE($2, avatar_url),
+           banner_url = COALESCE($3, banner_url)
+       WHERE id = $4
+       RETURNING id, public_id, username, email, avatar_url, banner_url, role, likes_count`,
+      [username, avatarUrl, bannerUrl, userId]
     );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
+    console.error('Update profile error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// 2. ЛАЙК ПРОФИЛЯ С КУЛДАУНОМ 3 ЧАСА
-// ==========================================
 app.post('/api/profile/:targetUserId/like', async (req, res) => {
   const { fromUserId } = req.body;
   const { targetUserId } = req.params;
@@ -131,8 +260,8 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
 
   try {
     const lastLikeRes = await pool.query(
-      `SELECT created_at FROM profile_likes_log 
-       WHERE from_user_id = $1 AND to_user_id = $2 
+      `SELECT created_at FROM profile_likes_log
+       WHERE from_user_id = $1 AND to_user_id = $2
        ORDER BY created_at DESC LIMIT 1`,
       [fromUserId, targetUserId]
     );
@@ -144,8 +273,8 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
 
       if (timePassed < threeHoursInMs) {
         const remainingMinutes = Math.ceil((threeHoursInMs - timePassed) / (1000 * 60));
-        return res.status(429).json({ 
-          error: `Повторный лайк можно поставить через ${remainingMinutes} мин.` 
+        return res.status(429).json({
+          error: `Повторный лайк можно поставить через ${remainingMinutes} мин.`
         });
       }
     }
@@ -164,13 +293,41 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
     res.json({ success: true, message: 'Лайк успешно поставлен!' });
   } catch (err) {
     await pool.query('ROLLBACK');
+    console.error('Like error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ==========================================
-// 3. ДРОП КОЛЛЕКЦИОННОЙ КАРТОЧКИ (Таймер 10 минут)
+// 3. КАРТОЧКИ И ДРОП (Таймер 10 минут)
 // ==========================================
+
+app.get('/api/cards', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM cards ORDER BY id DESC`);
+    res.json({ success: true, cards: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/users/:userId/cards', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT uc.id AS user_card_id, uc.obtained_at, c.*
+       FROM user_cards uc
+       JOIN cards c ON uc.card_id = c.id
+       WHERE uc.user_id = $1
+       ORDER BY uc.obtained_at DESC`,
+      [userId]
+    );
+    res.json({ success: true, cards: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/cards/claim-drop', async (req, res) => {
   const { userId } = req.body;
 
@@ -184,7 +341,10 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     if (cdRes.rows.length > 0) {
       const lastDrop = new Date(cdRes.rows[0].last_drop_at).getTime();
       if (Date.now() - lastDrop < tenMinutesInMs) {
-        return res.status(429).json({ error: 'Карточка еще не готова к получению.' });
+        const remainingSec = Math.ceil((tenMinutesInMs - (Date.now() - lastDrop)) / 1000);
+        return res.status(429).json({
+          error: `Карточка еще не готова. Осталось ${remainingSec} сек.`
+        });
       }
     }
 
@@ -196,13 +356,17 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     else if (rand > 75.0) selectedRarity = 'B';
     else if (rand > 50.0) selectedRarity = 'C';
 
-    const cardRes = await pool.query(
+    let cardRes = await pool.query(
       `SELECT * FROM cards WHERE rarity = $1 ORDER BY RANDOM() LIMIT 1`,
       [selectedRarity]
     );
 
     if (cardRes.rows.length === 0) {
-      return res.status(444).json({ error: 'Карточки данного ранга пока отсутствуют' });
+      cardRes = await pool.query(`SELECT * FROM cards ORDER BY RANDOM() LIMIT 1`);
+    }
+
+    if (cardRes.rows.length === 0) {
+      return res.status(404).json({ error: 'В базе данных пока нет ни одной карточки' });
     }
 
     const droppedCard = cardRes.rows[0];
@@ -222,9 +386,116 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     res.json({ success: true, card: droppedCard });
   } catch (err) {
     await pool.query('ROLLBACK');
+    console.error('Claim drop error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// ==========================================
+// 4. СИСТЕМА ОБМЕНА КАРТОЧКАМИ (v18)
+// ==========================================
+
+app.get('/api/trades/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT t.*,
+              u_send.username AS sender_name,
+              u_recv.username AS receiver_name,
+              c_send.name AS sender_card_name,
+              c_send.rarity AS sender_card_rarity,
+              c_recv.name AS receiver_card_name,
+              c_recv.rarity AS receiver_card_rarity
+       FROM trades t
+       LEFT JOIN users u_send ON t.sender_id = u_send.id
+       LEFT JOIN users u_recv ON t.receiver_id = u_recv.id
+       LEFT JOIN user_cards uc_send ON t.sender_user_card_id = uc_send.id
+       LEFT JOIN cards c_send ON uc_send.card_id = c_send.id
+       LEFT JOIN user_cards uc_recv ON t.receiver_user_card_id = uc_recv.id
+       LEFT JOIN cards c_recv ON uc_recv.card_id = c_recv.id
+       WHERE t.sender_id = $1 OR t.receiver_id = $1
+       ORDER BY t.created_at DESC`,
+      [userId]
+    );
+    res.json({ success: true, trades: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/trades', async (req, res) => {
+  const { senderId, receiverId, senderUserCardId, receiverUserCardId } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO trades (sender_id, receiver_id, sender_user_card_id, receiver_user_card_id, status)
+       VALUES ($1, $2, $3, $4, 'pending')
+       RETURNING *`,
+      [senderId, receiverId, senderUserCardId, receiverUserCardId]
+    );
+    res.status(201).json({ success: true, trade: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/trades/:tradeId/respond', async (req, res) => {
+  const { tradeId } = req.params;
+  const { action } = req.body; // 'accept' или 'reject'
+
+  try {
+    const tradeRes = await pool.query(`SELECT * FROM trades WHERE id = $1`, [tradeId]);
+    if (tradeRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Обмен не найден' });
+    }
+
+    const trade = tradeRes.rows[0];
+    if (trade.status !== 'pending') {
+      return res.status(400).json({ error: 'Этот обмен уже завершен' });
+    }
+
+    if (action === 'reject') {
+      await pool.query(`UPDATE trades SET status = 'rejected' WHERE id = $1`, [tradeId]);
+      return res.json({ success: true, message: 'Обмен отклонен' });
+    }
+
+    if (action === 'accept') {
+      await pool.query('BEGIN');
+
+      if (trade.sender_user_card_id) {
+        await pool.query(
+          `UPDATE user_cards SET user_id = $1 WHERE id = $2`,
+          [trade.receiver_id, trade.sender_user_card_id]
+        );
+      }
+
+      if (trade.receiver_user_card_id) {
+        await pool.query(
+          `UPDATE user_cards SET user_id = $1 WHERE id = $2`,
+          [trade.sender_id, trade.receiver_user_card_id]
+        );
+      }
+
+      await pool.query(`UPDATE trades SET status = 'accepted' WHERE id = $1`, [tradeId]);
+      await pool.query('COMMIT');
+
+      return res.json({ success: true, message: 'Обмен успешно выполнен!' });
+    }
+
+    res.status(400).json({ error: 'Неизвестное действие' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Trade respond error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Проверка работоспособности сервера
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  await initDB();
+});
