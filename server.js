@@ -17,6 +17,19 @@ function hashPassword(password) {
   return crypto.createHash('sha256').update(password + salt).digest('hex');
 }
 
+// Вспомогательная функция для конвертации publicId ("MC-XXXXXX") в реальный id базы данных
+async function resolveUserId(clientOrPool, val) {
+  if (!val) return null;
+  const strVal = String(val);
+  if (strVal.startsWith('MC-')) {
+    const res = await clientOrPool.query('SELECT id FROM users WHERE public_id = $1', [strVal]);
+    if (res.rows.length > 0) {
+      return res.rows[0].id;
+    }
+  }
+  return val;
+}
+
 // 1. РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
 app.post('/api/register', async (req, res) => {
   const { email, password, nickname } = req.body;
@@ -69,7 +82,7 @@ app.post('/api/login', async (req, res) => {
         id: user.id,
         email: user.email,
         nickname: user.nickname,
-        publicId: user.public_id || ('MC-' + Math.abs(parseInt(user.id.replace(/-/g,''), 16)) % 900000 + 100000),
+        publicId: user.public_id || ('MC-' + Math.abs(parseInt(String(user.id).replace(/-/g,''), 16)) % 900000 + 100000),
         avatar: user.avatar_url || '',
         banner: user.banner_url || '',
         likesCount: user.likes_count || 0
@@ -103,8 +116,9 @@ app.post('/api/upload-page', async (req, res) => {
 
 // 5. ОБНОВЛЕНИЕ ПРОФИЛЯ
 app.patch('/api/profile', async (req, res) => {
-  const { userId, avatarUrl, bannerUrl, nickname } = req.body;
+  let { userId, avatarUrl, bannerUrl, nickname } = req.body;
   try {
+    const realUserId = await resolveUserId(pool, userId);
     const result = await pool.query(
       `UPDATE users 
        SET avatar_url = COALESCE($1, avatar_url), 
@@ -112,7 +126,7 @@ app.patch('/api/profile', async (req, res) => {
            username = COALESCE($3, username)
        WHERE id = $4 
        RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, likes_count as "likesCount", public_id as "publicId"`,
-      [avatarUrl, bannerUrl, nickname, userId]
+      [avatarUrl, bannerUrl, nickname, realUserId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Пользователь не найден' });
     res.json({ success: true, user: result.rows[0] });
@@ -123,19 +137,22 @@ app.patch('/api/profile', async (req, res) => {
 
 // 6. ЛАЙК ПРОФИЛЯ С КУЛДАУНОМ 3 ЧАСА
 app.post('/api/profile/:targetUserId/like', async (req, res) => {
-  const { fromUserId } = req.body;
-  const { targetUserId } = req.params;
-
-  if (fromUserId === targetUserId) {
-    return res.status(400).json({ error: 'Нельзя ставить лайк самому себе' });
-  }
+  let { fromUserId } = req.body;
+  let { targetUserId } = req.params;
 
   try {
+    const realFromId = await resolveUserId(pool, fromUserId);
+    const realTargetId = await resolveUserId(pool, targetUserId);
+
+    if (realFromId === realTargetId) {
+      return res.status(400).json({ error: 'Нельзя ставить лайк самому себе' });
+    }
+
     const lastLikeRes = await pool.query(
       `SELECT created_at FROM profile_likes_log 
        WHERE from_user_id = $1 AND to_user_id = $2 
        ORDER BY created_at DESC LIMIT 1`,
-      [fromUserId, targetUserId]
+      [realFromId, realTargetId]
     );
 
     if (lastLikeRes.rows.length > 0) {
@@ -154,11 +171,11 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
     await pool.query('BEGIN');
     await pool.query(
       `INSERT INTO profile_likes_log (from_user_id, to_user_id) VALUES ($1, $2)`,
-      [fromUserId, targetUserId]
+      [realFromId, realTargetId]
     );
     await pool.query(
       `UPDATE users SET likes_count = likes_count + 1 WHERE id = $1`,
-      [targetUserId]
+      [realTargetId]
     );
     await pool.query('COMMIT');
 
@@ -171,12 +188,14 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
 
 // 7. ДРОП КОЛЛЕКЦИОННОЙ КАРТОЧКИ
 app.post('/api/cards/claim-drop', async (req, res) => {
-  const { userId } = req.body;
+  let { userId } = req.body;
 
   try {
+    const realUserId = await resolveUserId(pool, userId);
+
     const cdRes = await pool.query(
       `SELECT last_drop_at FROM card_drop_cooldowns WHERE user_id = $1`,
-      [userId]
+      [realUserId]
     );
 
     const tenMinutesInMs = 10 * 60 * 1000;
@@ -209,12 +228,12 @@ app.post('/api/cards/claim-drop', async (req, res) => {
     await pool.query('BEGIN');
     await pool.query(
       `INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)`,
-      [userId, droppedCard.id]
+      [realUserId, droppedCard.id]
     );
     await pool.query(
       `INSERT INTO card_drop_cooldowns (user_id, last_drop_at) VALUES ($1, NOW())
        ON CONFLICT (user_id) DO UPDATE SET last_drop_at = NOW()`,
-      [userId]
+      [realUserId]
     );
     await pool.query('COMMIT');
 
