@@ -244,7 +244,7 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
-// Проксирование изображений из Telegram по file_id
+// Проксирование изображений из Telegram по file_id (Исправлено: api.telegram.org/file)
 app.get('/api/proxy-image', async (req, res) => {
   const fileId = req.query.file_id;
   if (!fileId) {
@@ -264,7 +264,11 @@ app.get('/api/proxy-image', async (req, res) => {
     }
 
     const filePath = fileData.result.file_path;
-    const imageRes = await fetch(`https://api.telegram.file/bot${botToken}/${filePath}`);
+    const imageRes = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+    if (!imageRes.ok) {
+      return res.status(500).send('Failed to fetch file from Telegram servers');
+    }
+
     const arrayBuffer = await imageRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
