@@ -245,4 +245,28 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chapters (
+          id SERIAL PRIMARY KEY,
+          manga_id TEXT NOT NULL,
+          chapter_number NUMERIC NOT NULL,
+          title TEXT,
+          pages JSONB,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          CONSTRAINT unique_manga_chapter UNIQUE (manga_id, chapter_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_chapters_manga_id ON chapters(manga_id);
+    `);
+    console.log('[DB] Таблица chapters успешно проверена / создана.');
+  } catch (err) {
+    console.error('[DB ERROR] Ошибка инициализации таблицы chapters:', err.message);
+  }
+}
+
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  await initDatabase();
+});
