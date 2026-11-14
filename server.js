@@ -123,32 +123,40 @@ app.post('/api/upload-page', async (req, res) => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  // Если токен Telegram не настроен на сервере, возвращаем Base64 как резервный вариант
   if (!botToken || !chatId) {
-    return res.json({ success: true, url: imageBase64 });
+    console.error('[UPLOAD ERROR] TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы в переменных окружения!');
+    return.status(500).json({ error: 'Telegram не настроен на сервере (нет ключей)' });
   }
 
   try {
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
+    
     const formData = new FormData();
     formData.append('chat_id', chatId);
     formData.append('document', new Blob([buffer]), fileName || 'page.jpg');
+
+    console.log(`[UPLOAD] Отправка файла ${fileName || 'page.jpg'} в Telegram (chat_id: ${chatId})...`);
 
     const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
       method: 'POST',
       body: formData
     });
+    
     const tgData = await tgRes.json();
 
     if (!tgData.ok) {
-      return res.status(500).json({ error: 'Ошибка Telegram: ' + tgData.description });
+      console.error('[TELEGRAM API ERROR]:', tgData);
+      return res.status(500).json({ error: `Ошибка Telegram (${tgData.error_code}): ${tgData.description}` });
     }
 
     const fileId = tgData.result.document.file_id;
+    console.log(`[UPLOAD SUCCESS] Файл успешно принят Telegram. file_id: ${fileId}`);
+    
     res.json({ success: true, url: fileId });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[SERVER EXCEPTION during upload]:', err);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера при загрузке: ' + err.message });
   }
 });
 
