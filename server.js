@@ -244,11 +244,43 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
+// Проксирование изображений из Telegram по file_id
+app.get('/api/proxy-image', async (req, res) => {
+  const fileId = req.query.file_id;
+  if (!fileId) {
+    return res.status(400).send('file_id is required');
+  }
+
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) {
+    return res.status(500).send('TELEGRAM_BOT_TOKEN not configured');
+  }
+
+  try {
+    const fileRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+    const fileData = await fileRes.json();
+    if (!fileData.ok || !fileData.result.file_path) {
+      return res.status(404).send('File not found in Telegram');
+    }
+
+    const filePath = fileData.result.file_path;
+    const imageRes = await fetch(`https://api.telegram.file/bot${botToken}/${filePath}`);
+    const arrayBuffer = await imageRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+    res.send(buffer);
+  } catch (err) {
+    console.error('[PROXY ERROR]:', err);
+    res.status(500).send('Error proxying image: ' + err.message);
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 
 async function initDatabase() {
   try {
-    // Безопасное создание таблицы и добавление недостающих колонок, если она уже существовала
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chapters (
           id SERIAL PRIMARY KEY,
@@ -256,13 +288,9 @@ async function initDatabase() {
           chapter_number NUMERIC NOT NULL,
           title TEXT,
           pages JSONB,
-          created_at TIMESTAMPTZ DEFAULT NOW()
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          CONSTRAINT unique_manga_chapter UNIQUE (manga_id, chapter_number)
       );
-      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS manga_id TEXT;
-      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS chapter_number NUMERIC;
-      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS title TEXT;
-      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS pages JSONB;
-      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
       CREATE INDEX IF NOT EXISTS idx_chapters_manga_id ON chapters(manga_id);
     `);
     console.log('[DB] Таблица chapters успешно проверена / создана.');
