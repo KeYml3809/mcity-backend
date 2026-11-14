@@ -113,7 +113,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Загрузка изображений (страниц манги, аватаров, рамок) через Telegram-бота
+// Загрузка страниц в Telegram
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
   if (!imageBase64) {
@@ -125,7 +125,7 @@ app.post('/api/upload-page', async (req, res) => {
 
   if (!botToken || !chatId) {
     console.error('[UPLOAD ERROR] TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы в переменных окружения!');
-    return.status(500).json({ error: 'Telegram не настроен на сервере (нет ключей)' });
+    return res.status(500).json({ error: 'Telegram не настроен на сервере (нет ключей)' });
   }
 
   try {
