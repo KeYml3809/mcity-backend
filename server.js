@@ -113,7 +113,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Загрузка страниц в Telegram через sendPhoto с подробным логированием
+// Загрузка страниц/файлов в Telegram через sendDocument с защитой от PHOTO_INVALID_DIMENSIONS и с mimetype image/jpeg
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
   if (!imageBase64) {
@@ -132,13 +132,18 @@ app.post('/api/upload-page', async (req, res) => {
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
+    let safeFileName = fileName || 'page.jpg';
+    if (!safeFileName.match(/\.(jpg|jpeg|png)$/i)) {
+      safeFileName = 'page.jpg';
+    }
+
     const formData = new FormData();
     formData.append('chat_id', chatId);
-    formData.append('photo', new Blob([buffer]), fileName || 'page.jpg');
+    formData.append('document', new Blob([buffer], { type: 'image/jpeg' }), safeFileName);
 
-    console.log(`[UPLOAD] Отправка фото ${fileName || 'page.jpg'} в Telegram (chat_id: ${chatId})...`);
+    console.log(`[UPLOAD] Отправка документа ${safeFileName} в Telegram (chat_id: ${chatId})...`);
 
-    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
       method: 'POST',
       body: formData
     });
@@ -152,12 +157,12 @@ app.post('/api/upload-page', async (req, res) => {
     }
 
     let fileId = null;
-    if (tgData.result.photo && tgData.result.photo.length > 0) {
-      fileId = tgData.result.photo[tgData.result.photo.length - 1].file_id;
+    if (tgData.result.document) {
+      fileId = tgData.result.document.file_id;
     }
 
     if (!fileId) {
-      return res.status(500).json({ error: 'Telegram принял фото, но не вернул file_id.' });
+      return res.status(500).json({ error: 'Telegram принял файл, но не вернул file_id.' });
     }
 
     console.log(`[UPLOAD SUCCESS] Файл успешно принят Telegram. file_id: ${fileId}`);
