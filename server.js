@@ -113,7 +113,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Загрузка страниц в Telegram
+// Универсальная загрузка страниц в Telegram с защитой и расширенным логированием
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
   if (!imageBase64) {
@@ -144,15 +144,25 @@ app.post('/api/upload-page', async (req, res) => {
     });
     
     const tgData = await tgRes.json();
+    console.log('[TELEGRAM RAW RESPONSE]:', JSON.stringify(tgData));
 
     if (!tgData.ok) {
       console.error('[TELEGRAM API ERROR]:', tgData);
       return res.status(500).json({ error: `Ошибка Telegram (${tgData.error_code}): ${tgData.description}` });
     }
 
-    const fileId = tgData.result.document.file_id;
+    let fileId = null;
+    if (tgData.result.document) {
+      fileId = tgData.result.document.file_id;
+    } else if (tgData.result.photo && tgData.result.photo.length > 0) {
+      fileId = tgData.result.photo[tgData.result.photo.length - 1].file_id;
+    }
+
+    if (!fileId) {
+      return res.status(500).json({ error: 'Telegram принял файл, но не вернул file_id. Проверьте тип чата.' });
+    }
+
     console.log(`[UPLOAD SUCCESS] Файл успешно принят Telegram. file_id: ${fileId}`);
-    
     res.json({ success: true, url: fileId });
   } catch (err) {
     console.error('[SERVER EXCEPTION during upload]:', err);
