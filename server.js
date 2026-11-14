@@ -248,6 +248,7 @@ const PORT = process.env.PORT || 5000;
 
 async function initDatabase() {
   try {
+    // Безопасное создание таблицы и добавление недостающих колонок, если она уже существовала
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chapters (
           id SERIAL PRIMARY KEY,
@@ -255,9 +256,13 @@ async function initDatabase() {
           chapter_number NUMERIC NOT NULL,
           title TEXT,
           pages JSONB,
-          created_at TIMESTAMPTZ DEFAULT NOW(),
-          CONSTRAINT unique_manga_chapter UNIQUE (manga_id, chapter_number)
+          created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS manga_id TEXT;
+      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS chapter_number NUMERIC;
+      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS title TEXT;
+      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS pages JSONB;
+      ALTER TABLE chapters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
       CREATE INDEX IF NOT EXISTS idx_chapters_manga_id ON chapters(manga_id);
     `);
     console.log('[DB] Таблица chapters успешно проверена / создана.');
