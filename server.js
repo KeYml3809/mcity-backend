@@ -384,6 +384,84 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 });
 
+
+// Получить актуальный список друзей с их свежими никами, аватарами и баннерами
+app.get('/api/friends', async (req, res) => {
+  const { userId, id, publicId, email } = req.query;
+  try {
+    const realUserId = await resolveUserId(pool, { userId, id, publicId, email });
+    if (!realUserId) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const result = await pool.query(
+      `SELECT u.id as "userId", u.username as nickname, u.avatar_url as avatar, 
+              u.banner_url as banner, u.public_id as "publicId"
+       FROM friends f
+       JOIN users u ON u.id::text = f.friend_id
+       WHERE f.user_id = $1
+       ORDER BY f.created_at DESC`,
+      [String(realUserId)]
+    );
+
+    res.json({ success: true, friends: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Двустороннее добавление в друзья (при принятии заявки)
+app.post('/api/friends/accept', async (req, res) => {
+  const { userId, publicId, email, friendId } = req.body;
+  try {
+    const realUserId = await resolveUserId(pool, { userId, publicId, email });
+    const realFriendId = await resolveUserId(pool, { userId: friendId });
+
+    if (!realUserId || !realFriendId) {
+      return res.status(404).json({ error: 'Один из пользователей не найден' });
+    }
+    if (String(realUserId) === String(realFriendId)) {
+      return res.status(400).json({ error: 'Нельзя добавить самого себя' });
+    }
+
+    await pool.query('BEGIN');
+    await pool.query(
+      `INSERT INTO friends (user_id, friend_id) VALUES ($1, $2), ($2, $1) ON CONFLICT DO NOTHING`,
+      [String(realUserId), String(realFriendId)]
+    );
+    await pool.query('COMMIT');
+
+    res.json({ success: true });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Двустороннее удаление из друзей
+app.delete('/api/friends/:friendId', async (req, res) => {
+  const { userId, publicId, email } = req.body || req.query;
+  const { friendId } = req.params;
+  try {
+    const realUserId = await resolveUserId(pool, { userId, publicId, email });
+    const realFriendId = await resolveUserId(pool, { userId: friendId });
+
+    if (!realUserId || !realFriendId) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    await pool.query(
+      `DELETE FROM friends 
+       WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)`,
+      [String(realUserId), String(realFriendId)]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 
 async function initDatabase() {
@@ -399,10 +477,18 @@ async function initDatabase() {
           CONSTRAINT unique_manga_chapter UNIQUE (manga_id, chapter_number)
       );
       CREATE INDEX IF NOT EXISTS idx_chapters_manga_id ON chapters(manga_id);
+
+      CREATE TABLE IF NOT EXISTS friends (
+          user_id TEXT NOT NULL,
+          friend_id TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (user_id, friend_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_friends_user_id ON friends(user_id);
     `);
-    console.log('[DB] Таблица chapters успешно проверена / создана.');
+    console.log('[DB] Таблицы chapters и friends успешно проверены / созданы.');
   } catch (err) {
-    console.error('[DB ERROR] Ошибка инициализации таблицы chapters:', err.message);
+    console.error('[DB ERROR] Ошибка инициализации таблиц:', err.message);
   }
 }
 
