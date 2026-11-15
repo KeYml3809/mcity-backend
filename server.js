@@ -17,16 +17,54 @@ function hashPassword(password) {
   return crypto.createHash('sha256').update(password + salt).digest('hex');
 }
 
-async function resolveUserId(clientOrPool, val) {
-  if (!val) return null;
-  const strVal = String(val);
-  if (strVal.startsWith('MC-')) {
-    const res = await clientOrPool.query('SELECT id FROM users WHERE public_id = $1', [strVal]);
-    if (res.rows.length > 0) {
-      return res.rows[0].id;
+/**
+ * Универсальный резолвер пользователя.
+ * Ищет реальный системный UUID в БД по любому переданному идентификатору или набору параметров:
+ * { userId, id, publicId, email } или примитивной строке/числу.
+ */
+async function resolveUserId(clientOrPool, identifier) {
+  if (!identifier) return null;
+
+  let candidates = [];
+
+  if (typeof identifier === 'object' && identifier !== null) {
+    // Собираем все возможные поля в порядке приоритета
+    if (identifier.id) candidates.push({ type: 'id', val: String(identifier.id).trim() });
+    if (identifier.userId) candidates.push({ type: 'any', val: String(identifier.userId).trim() });
+    if (identifier.publicId) candidates.push({ type: 'public_id', val: String(identifier.publicId).trim() });
+    if (identifier.public_id) candidates.push({ type: 'public_id', val: String(identifier.public_id).trim() });
+    if (identifier.email) candidates.push({ type: 'email', val: String(identifier.email).trim().toLowerCase() });
+  } else {
+    candidates.push({ type: 'any', val: String(identifier).trim() });
+  }
+
+  for (const item of candidates) {
+    if (!item.val) continue;
+
+    // 1. Поиск по public_id (MC-...)
+    if (item.type === 'public_id' || (item.type === 'any' && item.val.startsWith('MC-'))) {
+      const res = await clientOrPool.query('SELECT id FROM users WHERE public_id = $1', [item.val]);
+      if (res.rows.length > 0) return res.rows[0].id;
+    }
+
+    // 2. Поиск по email
+    if (item.type === 'email' || (item.type === 'any' && item.val.includes('@'))) {
+      const res = await clientOrPool.query('SELECT id FROM users WHERE LOWER(email) = $1', [item.val.toLowerCase()]);
+      if (res.rows.length > 0) return res.rows[0].id;
+    }
+
+    // 3. Поиск по системному id (UUID или число) с приведением к text для защиты от ошибок типов
+    if (item.type === 'id' || item.type === 'any') {
+      try {
+        const res = await clientOrPool.query('SELECT id FROM users WHERE id::text = $1', [item.val]);
+        if (res.rows.length > 0) return res.rows[0].id;
+      } catch (e) {
+        // Игнорируем синтаксическую ошибку при несовпадении формата
+      }
     }
   }
-  return val;
+
+  return null;
 }
 
 app.post('/api/register', async (req, res) => {
@@ -79,7 +117,7 @@ app.post('/api/login', async (req, res) => {
         id: user.id,
         email: user.email,
         nickname: user.nickname,
-        publicId: user.public_id || ('MC-' + Math.abs(parseInt(String(user.id).replace(/-/g,''), 16)) % 900000 + 100000),
+        publicId: user.public_id || ('MC-' + (Math.abs(parseInt(String(user.id).replace(/-/g, ''), 16)) % 900000 + 100000)),
         avatar: user.avatar_url || '',
         banner: user.banner_url || '',
         likesCount: user.likes_count || 0
@@ -113,6 +151,40 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// Точечный запрос конкретного пользователя по любому из параметров: userId, id, publicId, email
+app.get('/api/user', async (req, res) => {
+  const { userId, id, publicId, email } = req.query;
+  try {
+    const realUserId = await resolveUserId(pool, { userId, id, publicId, email });
+    if (!realUserId) {
+      return res.status(404).json({ error: 'Пользователь не найден по переданным параметрам' });
+    }
+
+    const result = await pool.query(
+      `SELECT id as "userId", id, username as nickname, email, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId", COALESCE(cards, '[]'::jsonb) as cards 
+       FROM users 
+       WHERE id = $1`,
+      [realUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      success: true,
+      user: {
+        ...user,
+        cards: Array.isArray(user.cards) ? user.cards : [],
+        cardsCount: Array.isArray(user.cards) ? user.cards.length : 0
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Загрузка файлов/карточек в Telegram через sendDocument с принудительной заменой на .jpg и image/jpeg
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
@@ -132,15 +204,13 @@ app.post('/api/upload-page', async (req, res) => {
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
-    // ПРИНУДИТЕЛЬНАЯ ЗАМЕНА: вне зависимости от исходного имени, делаем файл с расширением .jpg
     let safeFileName = 'card_' + Date.now() + '.jpg';
     if (fileName) {
-      // Убираем старое расширение и принудительно ставим .jpg
       const baseName = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
       safeFileName = `${baseName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`;
     }
     
-    const mimeType = 'image/jpeg'; // Принудительный тип для отсутствия сжатия и корректного чтения
+    const mimeType = 'image/jpeg';
 
     const formData = new FormData();
     formData.append('chat_id', chatId);
@@ -178,15 +248,21 @@ app.post('/api/upload-page', async (req, res) => {
   }
 });
 
+// Обновление профиля: принимает userId, id, publicId и/или email одновременно для безошибочной идентификации
 app.patch('/api/profile', async (req, res) => {
-  let { userId, avatarUrl, bannerUrl, nickname, cards } = req.body;
+  let { userId, id, publicId, email, avatarUrl, bannerUrl, nickname, cards } = req.body;
   try {
-    const realUserId = await resolveUserId(pool, userId);
+    const realUserId = await resolveUserId(pool, { userId, id, publicId, email });
+    if (!realUserId) {
+      return res.status(404).json({ error: 'Пользователь не найден ни по одному из идентификаторов (userId, publicId, email)' });
+    }
+
     if (cards !== undefined) {
       try {
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cards JSONB DEFAULT '[]'::jsonb`);
       } catch (e) {}
     }
+
     const result = await pool.query(
       `UPDATE users 
        SET avatar_url = COALESCE($1, avatar_url), 
@@ -194,25 +270,42 @@ app.patch('/api/profile', async (req, res) => {
            username = COALESCE($3, username),
            cards = COALESCE($4::jsonb, cards)
        WHERE id = $5 
-       RETURNING id, username as nickname, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId", COALESCE(cards, '[]'::jsonb) as cards`,
-      [avatarUrl, bannerUrl, nickname, cards ? JSON.stringify(cards) : null, realUserId]
+       RETURNING id, id as "userId", username as nickname, email, avatar_url as avatar, banner_url as banner, COALESCE(likes_count, 0) as "likesCount", public_id as "publicId", COALESCE(cards, '[]'::jsonb) as cards`,
+      [avatarUrl ?? null, bannerUrl ?? null, nickname ?? null, cards !== undefined ? JSON.stringify(cards) : null, realUserId]
     );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден при обновлении' });
+    }
+
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Лайк профиля: поддерживает передачу как через URL, так и через тело запроса (userId, publicId, email)
 app.post('/api/profile/:targetUserId/like', async (req, res) => {
-  let { fromUserId } = req.body;
+  let { fromUserId, fromPublicId, fromEmail, targetPublicId, targetEmail } = req.body;
   let { targetUserId } = req.params;
 
   try {
-    const realFromId = await resolveUserId(pool, fromUserId);
-    const realTargetId = await resolveUserId(pool, targetUserId);
+    const realFromId = await resolveUserId(pool, {
+      userId: fromUserId,
+      publicId: fromPublicId,
+      email: fromEmail
+    });
+    const realTargetId = await resolveUserId(pool, {
+      userId: targetUserId,
+      publicId: targetPublicId,
+      email: targetEmail
+    });
 
-    if (realFromId === realTargetId) {
+    if (!realFromId || !realTargetId) {
+      return res.status(404).json({ error: 'Отправитель или получатель лайка не найден' });
+    }
+
+    if (String(realFromId) === String(realTargetId)) {
       return res.status(400).json({ error: 'Нельзя ставить лайк самому себе' });
     }
 
