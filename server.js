@@ -113,7 +113,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Загрузка страниц/файлов в Telegram через sendDocument с защитой от PHOTO_INVALID_DIMENSIONS и с mimetype image/jpeg
+// Загрузка файлов/карточек в Telegram через sendDocument с принудительной заменой на .jpg и image/jpeg
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
   if (!imageBase64) {
@@ -132,19 +132,21 @@ app.post('/api/upload-page', async (req, res) => {
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
-    let safeFileName = fileName || 'page.jpg';
-    if (!safeFileName.match(/\.(jpg|jpeg|png|webp|gif)$/i)) {
-      safeFileName = 'page.jpg';
+    // ПРИНУДИТЕЛЬНАЯ ЗАМЕНА: вне зависимости от исходного имени, делаем файл с расширением .jpg
+    let safeFileName = 'card_' + Date.now() + '.jpg';
+    if (fileName) {
+      // Убираем старое расширение и принудительно ставим .jpg
+      const baseName = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
+      safeFileName = `${baseName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`;
     }
-    const mimeType = safeFileName.toLowerCase().endsWith('.png')
-      ? 'image/png'
-      : (safeFileName.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg');
+    
+    const mimeType = 'image/jpeg'; // Принудительный тип для отсутствия сжатия и корректного чтения
 
     const formData = new FormData();
     formData.append('chat_id', chatId);
     formData.append('document', new Blob([buffer], { type: mimeType }), safeFileName);
 
-    console.log(`[UPLOAD] Отправка документа ${safeFileName} в Telegram (chat_id: ${chatId})...`);
+    console.log(`[UPLOAD] Принудительная отправка файла ${safeFileName} (.jpg) как документ в Telegram (chat_id: ${chatId})...`);
 
     const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
       method: 'POST',
@@ -168,7 +170,7 @@ app.post('/api/upload-page', async (req, res) => {
       return res.status(500).json({ error: 'Telegram принял файл, но не вернул file_id.' });
     }
 
-    console.log(`[UPLOAD SUCCESS] Файл успешно принят Telegram. file_id: ${fileId}`);
+    console.log(`[UPLOAD SUCCESS] Файл успешно отправлен. file_id: ${fileId}`);
     res.json({ success: true, url: fileId });
   } catch (err) {
     console.error('[SERVER EXCEPTION during upload]:', err);
@@ -252,7 +254,7 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
-// Проксирование изображений из Telegram по file_id (Исправлено: api.telegram.org/file)
+// Проксирование изображений из Telegram по file_id
 app.get('/api/proxy-image', async (req, res) => {
   const fileId = req.query.file_id;
   if (!fileId) {
@@ -280,10 +282,7 @@ app.get('/api/proxy-image', async (req, res) => {
     const arrayBuffer = await imageRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    const contentType = filePath.toLowerCase().endsWith('.png')
-      ? 'image/png'
-      : (filePath.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg');
-    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=31536000');
     res.send(buffer);
   } catch (err) {
