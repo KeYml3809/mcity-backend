@@ -133,13 +133,16 @@ app.post('/api/upload-page', async (req, res) => {
     const buffer = Buffer.from(base64Data, 'base64');
     
     let safeFileName = fileName || 'page.jpg';
-    if (!safeFileName.match(/\.(jpg|jpeg|png)$/i)) {
+    if (!safeFileName.match(/\.(jpg|jpeg|png|webp|gif)$/i)) {
       safeFileName = 'page.jpg';
     }
+    const mimeType = safeFileName.toLowerCase().endsWith('.png')
+      ? 'image/png'
+      : (safeFileName.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg');
 
     const formData = new FormData();
     formData.append('chat_id', chatId);
-    formData.append('document', new Blob([buffer], { type: 'image/jpeg' }), safeFileName);
+    formData.append('document', new Blob([buffer], { type: mimeType }), safeFileName);
 
     console.log(`[UPLOAD] Отправка документа ${safeFileName} в Telegram (chat_id: ${chatId})...`);
 
@@ -277,7 +280,10 @@ app.get('/api/proxy-image', async (req, res) => {
     const arrayBuffer = await imageRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    res.setHeader('Content-Type', 'image/jpeg');
+    const contentType = filePath.toLowerCase().endsWith('.png')
+      ? 'image/png'
+      : (filePath.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg');
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=31536000');
     res.send(buffer);
   } catch (err) {
