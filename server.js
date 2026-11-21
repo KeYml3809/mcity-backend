@@ -206,7 +206,12 @@ async function sendBufferToTelegramDocument(botToken, chatId, buffer, safeFileNa
     throw new Error(`Ошибка Telegram (${tgData.error_code}): ${tgData.description}`);
   }
 
-  const fileId = tgData.result && tgData.result.document ? tgData.result.document.file_id : null;
+  const r = tgData.result || {};
+  const fileId = (r.document && r.document.file_id)
+    || (r.animation && r.animation.file_id)
+    || (r.video && r.video.file_id)
+    || (Array.isArray(r.photo) && r.photo.length > 0 ? r.photo[r.photo.length - 1].file_id : null)
+    || null;
   if (!fileId) {
     throw new Error('Telegram принял файл, но не вернул file_id.');
   }
