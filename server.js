@@ -402,6 +402,48 @@ app.post('/api/profile/:targetUserId/like', async (req, res) => {
   }
 });
 
+
+// Серверный прокси для внешних API (MangaDex / AniList и т.п.) на случай блокировок/CORS в браузере
+app.get('/api/external/proxy', async (req, res) => {
+  const rawUrl = String(req.query.url || '').trim();
+  if (!rawUrl) {
+    return res.status(400).json({ error: 'url query param is required' });
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+
+  const allowedHosts = new Set([
+    'api.mangadex.org',
+    'uploads.mangadex.org',
+    'graphql.anilist.co'
+  ]);
+
+  if (parsed.protocol !== 'https:' || !allowedHosts.has(parsed.hostname)) {
+    return res.status(403).json({ error: 'Host is not allowed' });
+  }
+
+  try {
+    const upstreamRes = await fetch(parsed.toString(), {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'McityReader/1.0'
+      }
+    });
+    const text = await upstreamRes.text();
+    res.status(upstreamRes.status);
+    res.setHeader('Content-Type', upstreamRes.headers.get('content-type') || 'application/json; charset=utf-8');
+    res.send(text);
+  } catch (err) {
+    console.error('[EXTERNAL PROXY ERROR]:', err);
+    res.status(502).json({ error: 'Failed to fetch upstream resource: ' + err.message });
+  }
+});
+
 // Проксирование изображений из Telegram по file_id
 app.get('/api/proxy-image', async (req, res) => {
   const fileId = req.query.file_id;
