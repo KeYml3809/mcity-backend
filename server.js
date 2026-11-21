@@ -185,7 +185,85 @@ app.get('/api/user', async (req, res) => {
   }
 });
 
-// Загрузка файлов/карточек в Telegram через sendDocument с принудительной заменой на .jpg и image/jpeg
+// Вспомогательная отправка буфера в Telegram через sendDocument
+async function sendBufferToTelegramDocument(botToken, chatId, buffer, safeFileName, mimeType) {
+  const formData = new FormData();
+  formData.append('chat_id', chatId);
+  formData.append('document', new Blob([buffer], { type: mimeType }), safeFileName);
+
+  console.log(`[UPLOAD] Отправка файла ${safeFileName} (${mimeType}) как документ в Telegram (chat_id: ${chatId})...`);
+
+  const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+    method: 'POST',
+    body: formData
+  });
+
+  const tgData = await tgRes.json();
+  console.log('[TELEGRAM RAW RESPONSE]:', JSON.stringify(tgData));
+
+  if (!tgData.ok) {
+    console.error('[TELEGRAM API ERROR]:', tgData);
+    throw new Error(`Ошибка Telegram (${tgData.error_code}): ${tgData.description}`);
+  }
+
+  const fileId = tgData.result && tgData.result.document ? tgData.result.document.file_id : null;
+  if (!fileId) {
+    throw new Error('Telegram принял файл, но не вернул file_id.');
+  }
+
+  console.log(`[UPLOAD SUCCESS] Файл успешно отправлен. file_id: ${fileId}`);
+  return fileId;
+}
+
+// Отдельное правило загрузки ТОЛЬКО для анимаций стадий (сохраняется как .mp4 / анимация)
+app.post('/api/upload-animation', async (req, res) => {
+  const { animationBase64, imageBase64, fileName, fileType, mediaType } = req.body;
+  const rawPayload = animationBase64 || imageBase64;
+  if (!rawPayload) {
+    return res.status(400).json({ error: 'Файл анимации не передан' });
+  }
+
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.error('[UPLOAD ANIMATION ERROR] TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы в переменных окружения!');
+    return res.status(500).json({ error: 'Telegram не настроен на сервере (нет ключей)' });
+  }
+
+  try {
+    let detectedMime = '';
+    const dataUriMatch = /^data:([^;]+);base64,/.exec(rawPayload);
+    if (dataUriMatch && dataUriMatch[1]) {
+      detectedMime = dataUriMatch[1].trim().toLowerCase();
+    }
+
+    const base64Data = rawPayload.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    const rawName = String(fileName || ('animation_' + Date.now())).trim();
+    const dotIdx = rawName.lastIndexOf('.');
+    const rawBase = dotIdx > 0 ? rawName.substring(0, dotIdx) : rawName;
+    const cleanBase = rawBase.replace(/[^a-zA-Z0-9_-]/g, '_') || ('animation_' + Date.now());
+
+    // Для анимаций всегда сохраняем имя с расширением .mp4
+    const safeFileName = `${cleanBase}.mp4`;
+    const isGif = mediaType === 'gif' || fileType === 'image/gif' || detectedMime === 'image/gif' || /\.gif$/i.test(rawName);
+    const mimeType = isGif
+      ? 'image/gif'
+      : ((detectedMime && detectedMime.startsWith('video/'))
+        ? detectedMime
+        : ((fileType && String(fileType).startsWith('video/')) ? String(fileType).toLowerCase() : 'video/mp4'));
+
+    const fileId = await sendBufferToTelegramDocument(botToken, chatId, buffer, safeFileName, mimeType);
+    res.json({ success: true, url: fileId, fileName: safeFileName, mediaType: isGif ? 'gif' : 'mp4' });
+  } catch (err) {
+    console.error('[SERVER EXCEPTION during animation upload]:', err);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера при загрузке анимации: ' + err.message });
+  }
+});
+
+// Загрузка всех остальных файлов/карточек в Telegram строго как .jpg и image/jpeg
 app.post('/api/upload-page', async (req, res) => {
   const { imageBase64, fileName } = req.body;
   if (!imageBase64) {
@@ -201,46 +279,18 @@ app.post('/api/upload-page', async (req, res) => {
   }
 
   try {
-    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const base64Data = imageBase64.replace(/^data:[^;]+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
-    
+
     let safeFileName = 'card_' + Date.now() + '.jpg';
     if (fileName) {
-      const baseName = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
+      const dotIdx = fileName.lastIndexOf('.');
+      const baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
       safeFileName = `${baseName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`;
     }
-    
+
     const mimeType = 'image/jpeg';
-
-    const formData = new FormData();
-    formData.append('chat_id', chatId);
-    formData.append('document', new Blob([buffer], { type: mimeType }), safeFileName);
-
-    console.log(`[UPLOAD] Принудительная отправка файла ${safeFileName} (.jpg) как документ в Telegram (chat_id: ${chatId})...`);
-
-    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
-      method: 'POST',
-      body: formData
-    });
-    
-    const tgData = await tgRes.json();
-    console.log('[TELEGRAM RAW RESPONSE]:', JSON.stringify(tgData));
-
-    if (!tgData.ok) {
-      console.error('[TELEGRAM API ERROR]:', tgData);
-      return res.status(500).json({ error: `Ошибка Telegram (${tgData.error_code}): ${tgData.description}` });
-    }
-
-    let fileId = null;
-    if (tgData.result.document) {
-      fileId = tgData.result.document.file_id;
-    }
-
-    if (!fileId) {
-      return res.status(500).json({ error: 'Telegram принял файл, но не вернул file_id.' });
-    }
-
-    console.log(`[UPLOAD SUCCESS] Файл успешно отправлен. file_id: ${fileId}`);
+    const fileId = await sendBufferToTelegramDocument(botToken, chatId, buffer, safeFileName, mimeType);
     res.json({ success: true, url: fileId });
   } catch (err) {
     console.error('[SERVER EXCEPTION during upload]:', err);
@@ -375,7 +425,18 @@ app.get('/api/proxy-image', async (req, res) => {
     const arrayBuffer = await imageRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    res.setHeader('Content-Type', 'image/jpeg');
+    const lowerPath = String(filePath || '').toLowerCase();
+    let outContentType = 'application/octet-stream';
+    if (lowerPath.endsWith('.mp4')) outContentType = 'video/mp4';
+    else if (lowerPath.endsWith('.webm')) outContentType = 'video/webm';
+    else if (lowerPath.endsWith('.mov')) outContentType = 'video/quicktime';
+    else if (lowerPath.endsWith('.gif')) outContentType = 'image/gif';
+    else if (lowerPath.endsWith('.png')) outContentType = 'image/png';
+    else if (lowerPath.endsWith('.webp')) outContentType = 'image/webp';
+    else if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) outContentType = 'image/jpeg';
+    else if (imageRes.headers.get('content-type')) outContentType = imageRes.headers.get('content-type');
+
+    res.setHeader('Content-Type', outContentType);
     res.setHeader('Cache-Control', 'public, max-age=31536000');
     res.send(buffer);
   } catch (err) {
@@ -485,8 +546,16 @@ async function initDatabase() {
           PRIMARY KEY (user_id, friend_id)
       );
       CREATE INDEX IF NOT EXISTS idx_friends_user_id ON friends(user_id);
+
+      CREATE TABLE IF NOT EXISTS jester_stage_animations (
+          stage INTEGER PRIMARY KEY CHECK (stage IN (1, 2, 3)),
+          media_url TEXT,
+          media_type TEXT NOT NULL DEFAULT 'mp4',
+          file_name TEXT,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
-    console.log('[DB] Таблицы chapters и friends успешно проверены / созданы.');
+    console.log('[DB] Таблицы chapters, friends и jester_stage_animations успешно проверены / созданы.');
   } catch (err) {
     console.error('[DB ERROR] Ошибка инициализации таблиц:', err.message);
   }
