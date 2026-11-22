@@ -3,6 +3,7 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -23,7 +24,6 @@ const bannersDir = path.join(uploadsRoot, 'banners');
 fs.mkdirSync(bannersDir, { recursive: true });
 
 app.use(cors());
-// Увеличьте лимит тела запроса для загрузки видео/GIF (например, до 15 МБ)
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
@@ -58,7 +58,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // до 25 МБ
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (ALLOWED_MIMES[file.mimetype]) {
       cb(null, true);
@@ -222,24 +222,6 @@ function parseBase64Payload(rawInput) {
   };
 }
 
-function getFileIdFromUrlOrValue(val) {
-  const s = String(val || '').trim();
-  if (!s) return '';
-  if (s.includes('file_id=')) {
-    try {
-      const u = new URL(s);
-      return String(u.searchParams.get('file_id') || '').trim();
-    } catch (_) {
-      const m = s.match(/file_id=([^&]+)/);
-      return m ? decodeURIComponent(m[1]) : '';
-    }
-  }
-  if (!s.startsWith('http://') && !s.startsWith('https://') && !s.startsWith('/')) {
-    return s;
-  }
-  return '';
-}
-
 async function uploadBufferToTelegram(buffer, fileName, mimeType) {
   if (!TG_BOT_TOKEN || !TG_STORAGE_CHAT_ID) return null;
 
@@ -320,6 +302,7 @@ app.post('/api/upload-page', async (req, res) => {
     return res.status(500).json({ error: err.message || 'Ошибка загрузки файла' });
   }
 });
+
 app.post('/api/upload-animation', async (req, res) => {
   try {
     const body = req.body || {};
@@ -419,41 +402,346 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 });
 
-// --- Профили и пользователи (работа с таблицей profiles в PostgreSQL / Supabase) ---
-async function findProfileRow({ userId, publicId, email }) {
-  if (userId) {
-    const r = await pool.query('SELECT * FROM profiles WHERE id::text = $1 LIMIT 1', [String(userId).trim()]);
-    if (r.rows[0]) return r.rows[0];
-  }
-  if (publicId) {
-    const r = await pool.query('SELECT * FROM profiles WHERE public_id::text = $1 LIMIT 1', [String(publicId).trim()]);
-    if (r.rows[0]) return r.rows[0];
-  }
-  if (email) {
-    const r = await pool.query('SELECT * FROM profiles WHERE lower(email) = lower($1) LIMIT 1', [String(email).trim()]);
-    if (r.rows[0]) return r.rows[0];
-  }
-  return null;
+// --- Вспомогательные функции проверки всех таблиц пользователя ---
+function hashPasswordServer(plain) {
+  return crypto.createHash('sha256').update(String(plain || '')).digest('hex');
 }
 
-function formatProfileRow(row) {
+function generatePublicIdServer(seed) {
+  const h = crypto.createHash('sha256').update(String(seed || Date.now())).digest('hex');
+  const num = parseInt(h.slice(0, 8), 16) % 900000;
+  return 'MC-' + String(100000 + num);
+}
+
+function normalizeUserAuthRecord(row) {
   if (!row) return null;
+  const uid = String(row.id || row.user_id || '');
+  const nick = row.nickname || row.username || (row.email ? String(row.email).split('@')[0] : 'Пользователь');
   return {
-    id: row.id,
-    userId: row.id,
-    publicId: row.public_id || '',
-    nickname: row.nickname || 'Пользователь',
+    id: uid,
+    userId: uid,
+    username: row.username || nick,
+    nickname: nick,
     email: row.email || '',
-    avatar: row.avatar_url || '',
-    banner: row.banner_url || '',
+    publicId: row.public_id || generatePublicIdServer(uid || row.email),
+    avatar: row.avatar_url || row.avatar || '/avatars/default.png',
+    banner: row.banner_url || row.banner || '/banners/default.png',
     bio: row.bio || '',
     favoriteTitles: row.favorite_titles || '',
+    role: row.role || 'user',
     likesCount: Number(row.likes_count || 0),
     equippedAvatarFrameId: row.equipped_avatar_frame || 'auto',
     avatarFrameShape: row.avatar_frame_shape || 'circle',
     cards: Array.isArray(row.cards) ? row.cards : [],
     showcase: Array.isArray(row.showcase) ? row.showcase : [],
+    _passwordHash: row.password_hash || row.password || null,
+    _sourceTable: row._sourceTable || 'users',
   };
+}
+
+async function safeSelectOne(queryText, params, tableName) {
+  try {
+    const { rows } = await pool.query(queryText, params);
+    if (rows && rows[0]) {
+      return { ...rows[0], _sourceTable: tableName };
+    }
+    return null;
+  } catch (err) {
+    if (err && (err.code === '42P01' || err.code === '42703')) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function findAuthUserAcrossTables({ email, username, nickname, userId, publicId }) {
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  const cleanUser = String(username || '').trim().toLowerCase();
+  const cleanNick = String(nickname || '').trim().replace(/^@+/, '');
+  const cleanUid = String(userId || '').trim();
+  const cleanPubId = String(publicId || '').trim();
+
+  const candidates = [];
+
+  if (cleanEmail) {
+    const u1 = await safeSelectOne('SELECT * FROM public.users WHERE lower(email) = $1 LIMIT 1', [cleanEmail], 'users');
+    if (u1) candidates.push(u1);
+    const p1 = await safeSelectOne('SELECT * FROM public.profiles WHERE lower(email) = $1 LIMIT 1', [cleanEmail], 'profiles');
+    if (p1) candidates.push(p1);
+  }
+
+  if (cleanUid) {
+    const u2 = await safeSelectOne('SELECT * FROM public.users WHERE id::text = $1 LIMIT 1', [cleanUid], 'users');
+    if (u2 && !candidates.some((c) => String(c.id) === String(u2.id) && c._sourceTable === 'users')) candidates.push(u2);
+    const p2 = await safeSelectOne('SELECT * FROM public.profiles WHERE id::text = $1 LIMIT 1', [cleanUid], 'profiles');
+    if (p2 && !candidates.some((c) => String(c.id) === String(p2.id) && c._sourceTable === 'profiles')) candidates.push(p2);
+  }
+
+  if (cleanPubId) {
+    const uPub = await safeSelectOne('SELECT * FROM public.users WHERE public_id::text = $1 LIMIT 1', [cleanPubId], 'users');
+    if (uPub) candidates.push(uPub);
+    const pPub = await safeSelectOne('SELECT * FROM public.profiles WHERE public_id::text = $1 LIMIT 1', [cleanPubId], 'profiles');
+    if (pPub) candidates.push(pPub);
+  }
+
+  if (cleanUser || cleanNick) {
+    if (cleanUser) {
+      const u3 = await safeSelectOne('SELECT * FROM public.users WHERE lower(username) = $1 LIMIT 1', [cleanUser], 'users');
+      if (u3) candidates.push(u3);
+    }
+    if (cleanNick) {
+      const u4 = await safeSelectOne('SELECT * FROM public.users WHERE lower(nickname) = lower($1) LIMIT 1', [cleanNick], 'users');
+      if (u4) candidates.push(u4);
+      const p3 = await safeSelectOne('SELECT * FROM public.profiles WHERE lower(nickname) = lower($1) LIMIT 1', [cleanNick], 'profiles');
+      if (p3) candidates.push(p3);
+    }
+  }
+
+  if (cleanEmail) {
+    const au = await safeSelectOne(
+      'SELECT id, email, raw_user_meta_data FROM auth.users WHERE lower(email) = $1 LIMIT 1',
+      [cleanEmail],
+      'auth.users'
+    );
+    if (au) {
+      const meta = au.raw_user_meta_data && typeof au.raw_user_meta_data === 'object' ? au.raw_user_meta_data : {};
+      candidates.push({
+        id: au.id,
+        email: au.email,
+        nickname: meta.nickname || meta.username || cleanEmail.split('@')[0],
+        username: meta.username || meta.nickname || cleanEmail.split('@')[0],
+        public_id: meta.publicId || meta.public_id || generatePublicIdServer(au.id),
+        _sourceTable: 'auth.users',
+      });
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  const fromUsers = candidates.find((c) => c._sourceTable === 'users');
+  const fromProfiles = candidates.find((c) => c._sourceTable === 'profiles');
+  const fromAuth = candidates.find((c) => c._sourceTable === 'auth.users');
+
+  const merged = {
+    ...(fromAuth || {}),
+    ...(fromProfiles || {}),
+    ...(fromUsers || {}),
+    id: (fromUsers && fromUsers.id) || (fromProfiles && fromProfiles.id) || (fromAuth && fromAuth.id),
+    email: (fromUsers && fromUsers.email) || (fromProfiles && fromProfiles.email) || (fromAuth && fromAuth.email) || cleanEmail,
+    nickname: (fromUsers && fromUsers.nickname) || (fromProfiles && fromProfiles.nickname) || (fromAuth && fromAuth.nickname),
+    username: (fromUsers && fromUsers.username) || (fromProfiles && fromProfiles.nickname) || (fromAuth && fromAuth.username),
+    public_id: (fromUsers && fromUsers.public_id) || (fromProfiles && fromProfiles.public_id) || (fromAuth && fromAuth.public_id),
+    avatar_url: (fromUsers && fromUsers.avatar_url) || (fromProfiles && fromProfiles.avatar_url),
+    banner_url: (fromUsers && fromUsers.banner_url) || (fromProfiles && fromProfiles.banner_url),
+    cards: (Array.isArray(fromUsers?.cards) && fromUsers.cards.length > 0)
+      ? fromUsers.cards
+      : (Array.isArray(fromProfiles?.cards) ? fromProfiles.cards : []),
+    showcase: Array.isArray(fromProfiles?.showcase) ? fromProfiles.showcase : [],
+    password_hash: (fromUsers && fromUsers.password_hash) || (fromProfiles && fromProfiles.password_hash) || null,
+    _sourceTable: fromUsers ? 'users' : (fromProfiles ? 'profiles' : 'auth.users'),
+  };
+
+  return normalizeUserAuthRecord(merged);
+}
+
+function verifyPasswordMatch(plainPassword, storedHash) {
+  if (!storedHash) return true;
+  const plain = String(plainPassword || '');
+  const stored = String(storedHash).trim();
+  if (stored === plain) return true;
+  const sha256Hex = hashPasswordServer(plain);
+  if (stored.toLowerCase() === sha256Hex.toLowerCase()) return true;
+  return false;
+}
+
+async function ensureUserInUsersAndProfiles(record, plainPassword) {
+  const uid = record.id || crypto.randomUUID();
+  const cleanEmail = String(record.email || '').trim().toLowerCase();
+  const cleanNick = String(record.nickname || record.username || cleanEmail.split('@')[0] || 'user').trim();
+  const baseUser = String(record.username || cleanNick).toLowerCase().replace(/[^a-z0-9_.-]/g, '_') || 'user';
+  const username = baseUser.slice(0, 46);
+  const publicId = record.publicId || generatePublicIdServer(uid || cleanEmail);
+  const passwordHash = record._passwordHash || (plainPassword ? hashPasswordServer(plainPassword) : hashPasswordServer(crypto.randomUUID()));
+
+  try {
+    await pool.query(
+      `INSERT INTO public.users
+         (id, username, email, password_hash, avatar_url, banner_url, role, likes_count, nickname, public_id, cards)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        uid,
+        username,
+        cleanEmail,
+        passwordHash,
+        record.avatar || '/avatars/default.png',
+        record.banner || '/banners/default.png',
+        record.role || 'user',
+        Number(record.likesCount || 0),
+        cleanNick,
+        publicId,
+        JSON.stringify(Array.isArray(record.cards) ? record.cards : []),
+      ]
+    );
+  } catch (e) {
+    if (e && e.code !== '23505') {
+      console.warn('ensureUserInUsersAndProfiles users insert:', e.message || e);
+    }
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO public.profiles
+         (id, nickname, email, avatar_url, banner_url, bio, favorite_titles, equipped_avatar_frame, avatar_frame_shape, cards, showcase)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        uid,
+        cleanNick,
+        cleanEmail,
+        record.avatar || '/avatars/default.png',
+        record.banner || '/banners/default.png',
+        record.bio || '',
+        record.favoriteTitles || '',
+        record.equippedAvatarFrameId || 'auto',
+        record.avatarFrameShape || 'circle',
+        JSON.stringify(Array.isArray(record.cards) ? record.cards : []),
+        JSON.stringify(Array.isArray(record.showcase) ? record.showcase : []),
+      ]
+    );
+  } catch (e) {
+    if (e && e.code !== '23505' && e.code !== '42P01') {
+      console.warn('ensureUserInUsersAndProfiles profiles insert:', e.message || e);
+    }
+  }
+
+  return normalizeUserAuthRecord({
+    ...record,
+    id: uid,
+    username,
+    nickname: cleanNick,
+    email: cleanEmail,
+    public_id: publicId,
+    password_hash: passwordHash,
+  });
+}
+
+function toPublicSessionUser(rec) {
+  if (!rec) return null;
+  return {
+    id: rec.id,
+    userId: rec.id,
+    username: rec.username,
+    nickname: rec.nickname,
+    email: rec.email,
+    publicId: rec.publicId,
+    avatar: rec.avatar,
+    banner: rec.banner,
+    bio: rec.bio,
+    favoriteTitles: rec.favoriteTitles,
+    role: rec.role,
+    likesCount: rec.likesCount,
+    equippedAvatarFrameId: rec.equippedAvatarFrameId,
+    avatarFrameShape: rec.avatarFrameShape,
+    cards: rec.cards,
+    showcase: rec.showcase,
+  };
+}
+
+app.post('/api/register', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = String(body.email || '').trim().toLowerCase();
+    const password = String(body.password || '');
+    const rawNick = String(body.nickname || body.username || '').trim().replace(/^@+/, '');
+
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Укажите email и пароль' });
+    }
+
+    const nickname = rawNick || email.split('@')[0];
+    const username = (String(body.username || nickname).toLowerCase().replace(/[^a-z0-9_.-]/g, '_') || ('user_' + Date.now())).slice(0, 46);
+
+    const existing = await findAuthUserAcrossTables({ email, username, nickname });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: 'Пользователь с такими данными уже зарегистрирован',
+      });
+    }
+
+    const uid = crypto.randomUUID();
+    const publicId = 'MC-' + Math.floor(100000 + Math.random() * 900000);
+    const passwordHash = hashPasswordServer(password);
+
+    const { rows } = await pool.query(
+      `INSERT INTO public.users
+         (id, username, email, password_hash, avatar_url, banner_url, role, likes_count, nickname, public_id, cards)
+       VALUES ($1, $2, $3, $4, '/avatars/default.png', '/banners/default.png', 'user', 0, $5, $6, '[]'::jsonb)
+       RETURNING *`,
+      [uid, username, email, passwordHash, nickname, publicId]
+    );
+
+    const synced = await ensureUserInUsersAndProfiles(normalizeUserAuthRecord(rows[0]), password);
+    return res.status(201).json({
+      success: true,
+      user: toPublicSessionUser(synced),
+    });
+  } catch (err) {
+    console.error('POST /api/register:', err);
+    if (err && err.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Пользователь уже существует' });
+    }
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка регистрации' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const loginInput = String(body.email || body.login || body.username || '').trim();
+    const password = String(body.password || '');
+
+    if (!loginInput || !password) {
+      return res.status(400).json({ success: false, error: 'Введите email/логин и пароль' });
+    }
+
+    const isEmail = loginInput.includes('@');
+    const found = await findAuthUserAcrossTables({
+      email: isEmail ? loginInput.toLowerCase() : '',
+      username: !isEmail ? loginInput.toLowerCase() : '',
+      nickname: !isEmail ? loginInput : '',
+    });
+
+    if (!found) {
+      return res.status(401).json({ success: false, error: 'Неверный email/логин или пароль' });
+    }
+
+    if (!verifyPasswordMatch(password, found._passwordHash)) {
+      return res.status(401).json({ success: false, error: 'Неверный пароль' });
+    }
+
+    const syncedUser = await ensureUserInUsersAndProfiles(found, password);
+    return res.json({
+      success: true,
+      user: toPublicSessionUser(syncedUser),
+    });
+  } catch (err) {
+    console.error('POST /api/login:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка входа' });
+  }
+});
+
+// --- Профили и пользователи (проверка public.users, public.profiles и auth.users) ---
+async function findProfileRow({ userId, publicId, email }) {
+  const found = await findAuthUserAcrossTables({ userId, publicId, email });
+  return found;
+}
+
+function formatProfileRow(row) {
+  if (!row) return null;
+  const rec = row.userId ? row : normalizeUserAuthRecord(row);
+  return toPublicSessionUser(rec);
 }
 
 app.get('/api/user', async (req, res) => {
@@ -476,8 +764,42 @@ app.get('/api/user', async (req, res) => {
 
 app.get('/api/users', async (_req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM profiles ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200');
-    return res.json(rows.map(formatProfileRow));
+    const byId = new Map();
+
+    try {
+      const { rows: uRows } = await pool.query('SELECT * FROM public.users ORDER BY created_at DESC NULLS LAST LIMIT 200');
+      for (const r of uRows) {
+        const norm = normalizeUserAuthRecord({ ...r, _sourceTable: 'users' });
+        if (norm && norm.id) byId.set(String(norm.id), norm);
+      }
+    } catch (_) {}
+
+    try {
+      const { rows: pRows } = await pool.query('SELECT * FROM public.profiles ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200');
+      for (const r of pRows) {
+        const uid = String(r.id || '');
+        if (!uid) continue;
+        const prev = byId.get(uid);
+        if (prev) {
+          byId.set(uid, {
+            ...prev,
+            nickname: prev.nickname || r.nickname || prev.username,
+            avatar: (prev.avatar && prev.avatar !== '/avatars/default.png') ? prev.avatar : (r.avatar_url || prev.avatar),
+            banner: (prev.banner && prev.banner !== '/banners/default.png') ? prev.banner : (r.banner_url || prev.banner),
+            bio: r.bio || prev.bio || '',
+            favoriteTitles: r.favorite_titles || prev.favoriteTitles || '',
+            equippedAvatarFrameId: r.equipped_avatar_frame || prev.equippedAvatarFrameId || 'auto',
+            avatarFrameShape: r.avatar_frame_shape || prev.avatarFrameShape || 'circle',
+            cards: (Array.isArray(prev.cards) && prev.cards.length > 0) ? prev.cards : (Array.isArray(r.cards) ? r.cards : []),
+            showcase: Array.isArray(r.showcase) ? r.showcase : (prev.showcase || []),
+          });
+        } else {
+          byId.set(uid, normalizeUserAuthRecord({ ...r, _sourceTable: 'profiles' }));
+        }
+      }
+    } catch (_) {}
+
+    return res.json(Array.from(byId.values()).map(toPublicSessionUser));
   } catch (err) {
     console.error('GET /api/users:', err);
     return res.json([]);
@@ -503,52 +825,51 @@ app.patch('/api/profile', async (req, res) => {
     }
 
     const nextNickname = body.nickname !== undefined ? String(body.nickname) : (existing?.nickname || 'Пользователь');
-    const nextAvatar = avatarVal !== undefined ? String(avatarVal) : (existing?.avatar_url || '');
-    const nextBanner = bannerVal !== undefined ? String(bannerVal) : (existing?.banner_url || '');
+    const nextAvatar = avatarVal !== undefined ? String(avatarVal) : (existing?.avatar || '/avatars/default.png');
+    const nextBanner = bannerVal !== undefined ? String(bannerVal) : (existing?.banner || '/banners/default.png');
     const nextBio = body.bio !== undefined ? String(body.bio) : (existing?.bio || '');
-    const nextFav = body.favoriteTitles !== undefined ? String(body.favoriteTitles) : (existing?.favorite_titles || '');
-    const nextFrame = body.equippedAvatarFrameId !== undefined ? String(body.equippedAvatarFrameId) : (existing?.equipped_avatar_frame || 'auto');
-    const nextShape = body.avatarFrameShape !== undefined ? String(body.avatarFrameShape) : (existing?.avatar_frame_shape || 'circle');
+    const nextFav = body.favoriteTitles !== undefined ? String(body.favoriteTitles) : (existing?.favoriteTitles || '');
+    const nextFrame = body.equippedAvatarFrameId !== undefined ? String(body.equippedAvatarFrameId) : (existing?.equippedAvatarFrameId || 'auto');
+    const nextShape = body.avatarFrameShape !== undefined ? String(body.avatarFrameShape) : (existing?.avatarFrameShape || 'circle');
     const nextCards = Array.isArray(body.cards) ? body.cards : (Array.isArray(existing?.cards) ? existing.cards : []);
     const nextShowcase = Array.isArray(body.showcase) ? body.showcase : (Array.isArray(existing?.showcase) ? existing.showcase : []);
 
-    if (existing) {
-      const upd = await pool.query(
-        `UPDATE profiles
+    try {
+      await pool.query(
+        `UPDATE public.users
          SET nickname = $1,
              avatar_url = $2,
              banner_url = $3,
-             bio = $4,
-             favorite_titles = $5,
-             equipped_avatar_frame = $6,
-             avatar_frame_shape = $7,
-             cards = $8::jsonb,
-             showcase = $9::jsonb
-         WHERE id = $10
-         RETURNING *`,
-        [nextNickname, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, JSON.stringify(nextCards), JSON.stringify(nextShowcase), existing.id]
+             cards = $4::jsonb
+         WHERE id::text = $5`,
+        [nextNickname, nextAvatar, nextBanner, JSON.stringify(nextCards), targetId]
       );
-      return res.json({ success: true, user: formatProfileRow(upd.rows[0]) });
-    }
+    } catch (_) {}
 
-    const ins = await pool.query(
-      `INSERT INTO profiles (id, nickname, email, avatar_url, banner_url, bio, favorite_titles, equipped_avatar_frame, avatar_frame_shape, cards, showcase)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
-       ON CONFLICT (id) DO UPDATE SET
-         nickname = EXCLUDED.nickname,
-         avatar_url = EXCLUDED.avatar_url,
-         banner_url = EXCLUDED.banner_url,
-         bio = EXCLUDED.bio,
-         favorite_titles = EXCLUDED.favorite_titles,
-         equipped_avatar_frame = EXCLUDED.equipped_avatar_frame,
-         avatar_frame_shape = EXCLUDED.avatar_frame_shape,
-         cards = EXCLUDED.cards,
-         showcase = EXCLUDED.showcase
-       RETURNING *`,
-      [targetId, nextNickname, body.email || null, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, JSON.stringify(nextCards), JSON.stringify(nextShowcase)]
-    );
+    try {
+      const upd = await pool.query(
+        `INSERT INTO public.profiles (id, nickname, email, avatar_url, banner_url, bio, favorite_titles, equipped_avatar_frame, avatar_frame_shape, cards, showcase)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
+         ON CONFLICT (id) DO UPDATE SET
+           nickname = EXCLUDED.nickname,
+           avatar_url = EXCLUDED.avatar_url,
+           banner_url = EXCLUDED.banner_url,
+           bio = EXCLUDED.bio,
+           favorite_titles = EXCLUDED.favorite_titles,
+           equipped_avatar_frame = EXCLUDED.equipped_avatar_frame,
+           avatar_frame_shape = EXCLUDED.avatar_frame_shape,
+           cards = EXCLUDED.cards,
+           showcase = EXCLUDED.showcase
+         RETURNING *`,
+        [targetId, nextNickname, body.email || existing?.email || null, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, JSON.stringify(nextCards), JSON.stringify(nextShowcase)]
+      );
+      if (upd.rows[0]) {
+        return res.json({ success: true, user: formatProfileRow({ ...upd.rows[0], public_id: existing?.publicId }) });
+      }
+    } catch (_) {}
 
-    return res.json({ success: true, user: formatProfileRow(ins.rows[0]) });
+    const refreshed = await findAuthUserAcrossTables({ userId: targetId, email: body.email || existing?.email });
+    return res.json({ success: true, user: toPublicSessionUser(refreshed) });
   } catch (err) {
     console.error('PATCH /api/profile:', err);
     return res.status(500).json({ error: err.message || 'Ошибка обновления профиля' });
@@ -562,7 +883,7 @@ app.post('/api/profile/:targetId/like', async (req, res) => {
       return res.status(400).json({ error: 'Missing targetId' });
     }
     const upd = await pool.query(
-      `UPDATE profiles
+      `UPDATE public.users
        SET likes_count = COALESCE(likes_count, 0) + 1
        WHERE id::text = $1
        RETURNING likes_count`,
@@ -659,7 +980,6 @@ app.put(
   }
 );
 
-
 // 1. Получение текущего баннера лавки
 app.get('/api/shop-banner', async (_req, res) => {
   try {
@@ -715,4 +1035,3 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
-
