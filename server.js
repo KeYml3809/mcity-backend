@@ -911,18 +911,29 @@ app.get('/api/users', async (_req, res) => {
       }
     } catch (_) {}
 
+    let coinsMap = new Map();
+    try {
+      await ensureUserCoinsTable();
+      const { rows: cRows } = await pool.query('SELECT user_id, coins FROM public.user_coins');
+      for (const r of cRows) {
+        if (r && r.user_id) coinsMap.set(String(r.user_id), Math.max(0, Math.floor(Number(r.coins || 0))));
+      }
+    } catch (_) {}
+
     const resultList = Array.from(byId.values()).map((u) => {
       const pub = toPublicSessionUser(u);
-      const inv = invMap.get(String(pub.id || pub.userId));
+      const uid = String(pub.id || pub.userId);
+      const inv = invMap.get(uid);
+      const hasCoinRow = coinsMap.has(uid);
       if (inv) {
-        pub.jesterCoins = inv.jesterCoins;
+        pub.jesterCoins = hasCoinRow ? coinsMap.get(uid) : inv.jesterCoins;
         pub.bonusLevel = inv.bonusLevel;
         pub.purchasedFrames = inv.purchasedFrames;
         pub.purchasedShapes = inv.purchasedShapes;
         pub.purchasedBgs = inv.purchasedBgs;
         pub.equippedProfileBgId = inv.equippedProfileBgId;
       } else {
-        pub.jesterCoins = Number(pub.jesterCoins || 0);
+        pub.jesterCoins = hasCoinRow ? coinsMap.get(uid) : Number(pub.jesterCoins || 0);
         pub.bonusLevel = Number(pub.bonusLevel || 0);
         pub.purchasedFrames = Array.isArray(pub.purchasedFrames) ? pub.purchasedFrames : [];
         pub.purchasedShapes = Array.isArray(pub.purchasedShapes) ? pub.purchasedShapes : [];
@@ -1683,12 +1694,192 @@ function normalizeInventoryRow(row, fallbackUserId = '') {
   };
 }
 
+// --- Выделенная таблица хранения и синхронизации монет пользователей (public.user_coins) ---
+let userCoinsTableReady = false;
+async function ensureUserCoinsTable() {
+  if (userCoinsTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.user_coins (
+      user_id TEXT PRIMARY KEY,
+      coins INTEGER NOT NULL DEFAULT 0 CHECK (coins >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  try {
+    await pool.query('ALTER PUBLICATION supabase_realtime ADD TABLE public.user_coins');
+  } catch (_) {}
+  userCoinsTableReady = true;
+}
+
+async function getUserCoinsRecord(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return { userId: '', coins: 0, updatedAt: null };
+  await ensureUserCoinsTable();
+  const { rows } = await pool.query(
+    'SELECT user_id, coins, updated_at FROM public.user_coins WHERE user_id = $1 LIMIT 1',
+    [uid]
+  );
+  if (rows[0]) {
+    return {
+      userId: String(rows[0].user_id),
+      coins: Math.max(0, Math.floor(Number(rows[0].coins || 0))),
+      updatedAt: rows[0].updated_at ? new Date(rows[0].updated_at).toISOString() : new Date().toISOString(),
+    };
+  }
+  // Миграция/инициализация из user_inventory, если строка уже была там
+  let initialCoins = 0;
+  try {
+    await ensureUserInventoryTable();
+    const invRes = await pool.query('SELECT jester_coins FROM public.user_inventory WHERE user_id = $1 LIMIT 1', [uid]);
+    if (invRes.rows[0]) {
+      initialCoins = Math.max(0, Math.floor(Number(invRes.rows[0].jester_coins || 0)));
+    }
+  } catch (_) {}
+  const ins = await pool.query(
+    `INSERT INTO public.user_coins (user_id, coins, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET coins = public.user_coins.coins
+     RETURNING user_id, coins, updated_at`,
+    [uid, initialCoins]
+  );
+  return {
+    userId: uid,
+    coins: Math.max(0, Math.floor(Number(ins.rows[0]?.coins || initialCoins))),
+    updatedAt: ins.rows[0]?.updated_at ? new Date(ins.rows[0].updated_at).toISOString() : new Date().toISOString(),
+  };
+}
+
+async function setUserCoinsRecord(userId, exactCoins) {
+  const uid = String(userId || '').trim();
+  if (!uid) throw new Error('Missing userId');
+  await ensureUserCoinsTable();
+  const safeCoins = Math.max(0, Math.floor(Number(exactCoins) || 0));
+  const { rows } = await pool.query(
+    `INSERT INTO public.user_coins (user_id, coins, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET
+       coins = EXCLUDED.coins,
+       updated_at = NOW()
+     RETURNING user_id, coins, updated_at`,
+    [uid, safeCoins]
+  );
+  try {
+    await ensureUserInventoryTable();
+    await pool.query(
+      `INSERT INTO public.user_inventory (user_id, jester_coins, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         jester_coins = EXCLUDED.jester_coins,
+         updated_at = NOW()`,
+      [uid, safeCoins]
+    );
+  } catch (_) {}
+  return {
+    userId: uid,
+    coins: Math.max(0, Math.floor(Number(rows[0]?.coins ?? safeCoins))),
+    updatedAt: rows[0]?.updated_at ? new Date(rows[0].updated_at).toISOString() : new Date().toISOString(),
+  };
+}
+
+async function adjustUserCoinsRecord(userId, delta, requireSufficient = false) {
+  const uid = String(userId || '').trim();
+  if (!uid) throw new Error('Missing userId');
+  const d = Math.floor(Number(delta) || 0);
+  const current = await getUserCoinsRecord(uid);
+  if (d === 0) return { ...current, insufficient: false };
+  if (requireSufficient && d < 0 && current.coins + d < 0) {
+    return { ...current, insufficient: true };
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO public.user_coins (user_id, coins, updated_at)
+     VALUES ($1, GREATEST(0, $2::integer), NOW())
+     ON CONFLICT (user_id) DO UPDATE SET
+       coins = GREATEST(0, public.user_coins.coins + $2::integer),
+       updated_at = NOW()
+     RETURNING user_id, coins, updated_at`,
+    [uid, d]
+  );
+  const finalCoins = Math.max(0, Math.floor(Number(rows[0]?.coins ?? 0)));
+  try {
+    await ensureUserInventoryTable();
+    await pool.query(
+      `INSERT INTO public.user_inventory (user_id, jester_coins, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         jester_coins = EXCLUDED.jester_coins,
+         updated_at = NOW()`,
+      [uid, finalCoins]
+    );
+  } catch (_) {}
+  return {
+    userId: uid,
+    coins: finalCoins,
+    updatedAt: rows[0]?.updated_at ? new Date(rows[0].updated_at).toISOString() : new Date().toISOString(),
+    insufficient: false,
+  };
+}
+
+app.get('/api/coins/:userId', async (req, res) => {
+  try {
+    const uid = String(req.params.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Missing userId' });
+    const rec = await getUserCoinsRecord(uid);
+    return res.json({ success: true, ...rec });
+  } catch (err) {
+    console.error('GET /api/coins/:userId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки баланса монет из БД' });
+  }
+});
+
+app.put('/api/coins/:userId', async (req, res) => {
+  try {
+    const uid = String(req.params.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Missing userId' });
+    const rawCoins = req.body?.coins !== undefined ? req.body.coins : req.body?.jesterCoins;
+    if (rawCoins === undefined || rawCoins === null || Number.isNaN(Number(rawCoins))) {
+      return res.status(400).json({ success: false, error: 'Некорректное количество монет' });
+    }
+    const rec = await setUserCoinsRecord(uid, rawCoins);
+    return res.json({ success: true, ...rec });
+  } catch (err) {
+    console.error('PUT /api/coins/:userId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения баланса монет в БД' });
+  }
+});
+
+app.post('/api/coins/:userId/adjust', async (req, res) => {
+  try {
+    const uid = String(req.params.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Missing userId' });
+    const delta = Math.floor(Number(req.body?.delta || 0));
+    const requireSufficient = Boolean(req.body?.requireSufficient);
+    const rec = await adjustUserCoinsRecord(uid, delta, requireSufficient);
+    if (rec.insufficient) {
+      return res.status(400).json({
+        success: false,
+        code: 'INSUFFICIENT_COINS',
+        error: 'Недостаточно монет на балансе',
+        coins: rec.coins,
+      });
+    }
+    return res.json({ success: true, userId: rec.userId, coins: rec.coins, updatedAt: rec.updatedAt });
+  } catch (err) {
+    console.error('POST /api/coins/:userId/adjust:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка изменения баланса монет в БД' });
+  }
+});
+
 async function getUserInventoryRecord(userId) {
   const uid = String(userId || '').trim();
   if (!uid) return normalizeInventoryRow(null, '');
   await ensureUserInventoryTable();
   const { rows } = await pool.query('SELECT * FROM public.user_inventory WHERE user_id = $1 LIMIT 1', [uid]);
-  return normalizeInventoryRow(rows[0] || null, uid);
+  const inv = normalizeInventoryRow(rows[0] || null, uid);
+  try {
+    const coinRec = await getUserCoinsRecord(uid);
+    inv.jesterCoins = coinRec.coins;
+  } catch (_) {}
+  return inv;
 }
 
 async function upsertUserInventoryRecord(userId, patch = {}) {
@@ -1732,6 +1923,12 @@ async function upsertUserInventoryRecord(userId, patch = {}) {
      RETURNING *`,
     [uid, nextCoins, nextBonusLevel, JSON.stringify(nextFrames), JSON.stringify(nextShapes), JSON.stringify(nextBgs), nextBgId]
   );
+
+  if (patch.jesterCoins !== undefined) {
+    try {
+      await setUserCoinsRecord(uid, nextCoins);
+    } catch (_) {}
+  }
 
   return normalizeInventoryRow(rows[0], uid);
 }
