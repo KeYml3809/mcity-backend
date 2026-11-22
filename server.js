@@ -82,6 +82,76 @@ app.get('/health', async (_req, res) => {
   }
 });
 
+// --- Прокси для внешних API (MangaDex) ---
+const ALLOWED_PROXY_HOSTS = new Set([
+  'api.mangadex.org',
+  'uploads.mangadex.org',
+]);
+
+app.get('/api/external/proxy', async (req, res) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const rawUrl = String(req.query.url || '').trim();
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'Missing url parameter' });
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid url parameter' });
+    }
+
+    if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: 'Unsupported protocol' });
+    }
+
+    if (!ALLOWED_PROXY_HOSTS.has(parsedUrl.hostname)) {
+      return res.status(403).json({ error: 'Host is not allowed' });
+    }
+
+    const upstreamRes = await fetch(parsedUrl.toString(), {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'McityMangaLibrary/1.0 (contact@mcity.local)',
+        'Accept': 'application/json, text/plain, */*',
+      },
+    });
+
+    const contentType = upstreamRes.headers.get('content-type') || 'application/json; charset=utf-8';
+    const bodyText = await upstreamRes.text();
+
+    res.status(upstreamRes.status);
+    res.set('Content-Type', contentType);
+    return res.send(bodyText);
+  } catch (err) {
+    console.error('GET /api/external/proxy:', err);
+    return res.status(502).json({ error: 'External proxy request failed' });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+// --- Маршруты друзей и пользователей (JSON-ответы вместо HTML 404) ---
+app.get('/api/friends', async (_req, res) => {
+  return res.json({ friends: [], incoming: [], outgoing: [] });
+});
+
+app.get('/api/user', async (req, res) => {
+  const { userId, publicId, email } = req.query;
+  return res.status(404).json({
+    error: 'User endpoint is not configured on backend',
+    query: { userId, publicId, email },
+  });
+});
+
+app.get('/api/users', async (_req, res) => {
+  return res.json({ users: [] });
+});
+
 // --- Получить текущий баннер для лавки и админки ---
 app.get('/api/shop/banner', async (_req, res) => {
   try {
@@ -102,7 +172,6 @@ app.get('/api/shop/banner', async (_req, res) => {
 // --- Обновить баннер из админки ---
 app.put(
   '/api/admin/shop/banner',
-  // при необходимости сюда можно добавить middleware проверки прав админа
   uploadBannerMiddleware,
   async (req, res) => {
     try {
@@ -124,7 +193,6 @@ app.put(
         mediaType = ALLOWED_MIMES[req.file.mimetype];
         mediaUrl = `/uploads/banners/${req.file.filename}`;
 
-        // Удаляем старый локальный файл баннера, если он лежал в /uploads/banners/
         if (current?.media_url && current.media_url.startsWith('/uploads/banners/')) {
           const relativeFile = current.media_url.replace(/^\/uploads\/banners\//, '');
           const resolvedBannersDir = path.resolve(bannersDir);
@@ -166,6 +234,17 @@ app.put(
     }
   }
 );
+
+// --- JSON 404 для всех неизвестных /api/* маршрутов ---
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
+});
+
+// --- Глобальный обработчик ошибок в JSON ---
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
