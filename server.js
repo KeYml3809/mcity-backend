@@ -17,14 +17,32 @@ const pool = new Pool({
     : undefined,
 });
 
+// --- Инициализация таблицы settings для баннера (base64 / JSON) ---
+async function ensureSettingsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        url TEXT,
+        type TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  } catch (err) {
+    console.error('Ошибка создания таблицы settings:', err);
+  }
+}
+ensureSettingsTable();
+
 // --- Папка для загруженных баннеров и статика ---
 const uploadsRoot = path.join(__dirname, 'uploads');
 const bannersDir = path.join(uploadsRoot, 'banners');
 fs.mkdirSync(bannersDir, { recursive: true });
 
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Увеличиваем лимит тела запроса для загрузки видео/GIF в base64 (до 15 МБ)
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use('/uploads', express.static(uploadsRoot));
 
 // --- Настройка Multer ---
@@ -203,7 +221,52 @@ app.get('/api/users', async (_req, res) => {
   return res.json({ users: [] });
 });
 
-// --- Получить текущий баннер для лавки и админки ---
+// --- Шаг 1: Получение текущего баннера лавки (base64 / settings) ---
+app.get('/api/shop-banner', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT url, type
+       FROM settings
+       WHERE key = 'shop_banner'
+       LIMIT 1`
+    );
+
+    if (!rows[0]) {
+      return res.json({ url: null, type: null });
+    }
+
+    res.json({ url: rows[0].url, type: rows[0].type });
+  } catch (err) {
+    console.error('GET /api/shop-banner:', err);
+    res.status(500).json({ error: 'Ошибка получения баннера' });
+  }
+});
+
+// --- Шаг 1: Сохранение нового баннера из админки (base64 / settings) ---
+app.post('/api/admin/shop-banner', async (req, res) => {
+  try {
+    const { fileData, mimeType } = req.body || {};
+
+    if (!fileData || !mimeType) {
+      return res.status(400).json({ error: 'Файл не передан' });
+    }
+
+    await pool.query(
+      `INSERT INTO settings (key, url, type, updated_at)
+       VALUES ('shop_banner', $1, $2, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET url = EXCLUDED.url, type = EXCLUDED.type, updated_at = NOW()`,
+      [fileData, mimeType]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/admin/shop-banner:', err);
+    res.status(500).json({ error: 'Ошибка сохранения баннера в БД' });
+  }
+});
+
+// --- Получить текущий баннер для лавки и админки (через uploads/shop_banners) ---
 app.get('/api/shop/banner', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -220,7 +283,7 @@ app.get('/api/shop/banner', async (_req, res) => {
   }
 });
 
-// --- Обновить баннер из админки ---
+// --- Обновить баннер из админки (через multer + shop_banners) ---
 app.put(
   '/api/admin/shop/banner',
   uploadBannerMiddleware,
