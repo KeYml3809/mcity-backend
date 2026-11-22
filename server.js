@@ -23,7 +23,6 @@ const bannersDir = path.join(uploadsRoot, 'banners');
 fs.mkdirSync(bannersDir, { recursive: true });
 
 app.use(cors());
-// Увеличьте лимит тела запроса для загрузки видео/GIF (например, до 15 МБ)
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
@@ -35,6 +34,7 @@ pool.query(`
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )
 `).catch((err) => console.error('Ошибка создания таблицы settings:', err));
+
 app.use('/uploads', express.static(uploadsRoot));
 
 // --- Настройка Multer ---
@@ -58,7 +58,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // до 25 МБ
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (ALLOWED_MIMES[file.mimetype]) {
       cb(null, true);
@@ -145,7 +145,7 @@ app.get('/api/external/proxy', async (req, res) => {
   }
 });
 
-// --- Синхронизация друзей и заявок из таблицы friends / friend_requests ---
+// --- Синхронизация друзей и заявок ---
 app.get('/api/friends', async (req, res) => {
   try {
     const userId = String(req.query.userId || '').trim();
@@ -220,24 +220,6 @@ function parseBase64Payload(rawInput) {
     mimeType: 'application/octet-stream',
     buffer: Buffer.from(raw, 'base64'),
   };
-}
-
-function getFileIdFromUrlOrValue(val) {
-  const s = String(val || '').trim();
-  if (!s) return '';
-  if (s.includes('file_id=')) {
-    try {
-      const u = new URL(s);
-      return String(u.searchParams.get('file_id') || '').trim();
-    } catch (_) {
-      const m = s.match(/file_id=([^&]+)/);
-      return m ? decodeURIComponent(m[1]) : '';
-    }
-  }
-  if (!s.startsWith('http://') && !s.startsWith('https://') && !s.startsWith('/')) {
-    return s;
-  }
-  return '';
 }
 
 async function uploadBufferToTelegram(buffer, fileName, mimeType) {
@@ -368,7 +350,7 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 });
 
-// --- Профили и пользователи (работа с таблицей profiles в PostgreSQL / Supabase) ---
+// --- Профили и пользователи ---
 async function findProfileRow({ userId, publicId, email }) {
   if (userId) {
     const r = await pool.query('SELECT * FROM profiles WHERE id::text = $1 LIMIT 1', [String(userId).trim()]);
@@ -525,7 +507,7 @@ app.post('/api/profile/:targetId/like', async (req, res) => {
   }
 });
 
-// --- Получить текущий баннер для лавки и админки ---
+// --- Баннеры лавки ---
 app.get('/api/shop/banner', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -542,7 +524,6 @@ app.get('/api/shop/banner', async (_req, res) => {
   }
 });
 
-// --- Обновить баннер из админки ---
 app.put(
   '/api/admin/shop/banner',
   uploadBannerMiddleware,
@@ -608,8 +589,6 @@ app.put(
   }
 );
 
-
-// 1. Получение текущего баннера лавки
 app.get('/api/shop-banner', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -626,7 +605,6 @@ app.get('/api/shop-banner', async (_req, res) => {
   }
 });
 
-// 2. Сохранение нового баннера из админки
 app.post('/api/admin/shop-banner', async (req, res) => {
   try {
     const { fileData, mimeType } = req.body || {};
@@ -664,4 +642,4 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
-```[cite: 33, 35]
+```[cite: 27, 33, 35, 36]
