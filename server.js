@@ -458,6 +458,8 @@ app.patch('/api/profile', async (req, res) => {
     const nextFav = body.favoriteTitles !== undefined ? String(body.favoriteTitles) : (existing?.favorite_titles || '');
     const nextFrame = body.equippedAvatarFrameId !== undefined ? String(body.equippedAvatarFrameId) : (existing?.equipped_avatar_frame || 'auto');
     const nextShape = body.avatarFrameShape !== undefined ? String(body.avatarFrameShape) : (existing?.avatar_frame_shape || 'circle');
+    const nextCards = Array.isArray(body.cards) ? body.cards : (Array.isArray(existing?.cards) ? existing.cards : []);
+    const nextShowcase = Array.isArray(body.showcase) ? body.showcase : (Array.isArray(existing?.showcase) ? existing.showcase : []);
 
     if (existing) {
       const upd = await pool.query(
@@ -468,17 +470,19 @@ app.patch('/api/profile', async (req, res) => {
              bio = $4,
              favorite_titles = $5,
              equipped_avatar_frame = $6,
-             avatar_frame_shape = $7
-         WHERE id = $8
+             avatar_frame_shape = $7,
+             cards = $8::jsonb,
+             showcase = $9::jsonb
+         WHERE id = $10
          RETURNING *`,
-        [nextNickname, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, existing.id]
+        [nextNickname, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, JSON.stringify(nextCards), JSON.stringify(nextShowcase), existing.id]
       );
       return res.json({ success: true, user: formatProfileRow(upd.rows[0]) });
     }
 
     const ins = await pool.query(
-      `INSERT INTO profiles (id, nickname, email, avatar_url, banner_url, bio, favorite_titles, equipped_avatar_frame, avatar_frame_shape)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO profiles (id, nickname, email, avatar_url, banner_url, bio, favorite_titles, equipped_avatar_frame, avatar_frame_shape, cards, showcase)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
        ON CONFLICT (id) DO UPDATE SET
          nickname = EXCLUDED.nickname,
          avatar_url = EXCLUDED.avatar_url,
@@ -486,9 +490,11 @@ app.patch('/api/profile', async (req, res) => {
          bio = EXCLUDED.bio,
          favorite_titles = EXCLUDED.favorite_titles,
          equipped_avatar_frame = EXCLUDED.equipped_avatar_frame,
-         avatar_frame_shape = EXCLUDED.avatar_frame_shape
+         avatar_frame_shape = EXCLUDED.avatar_frame_shape,
+         cards = EXCLUDED.cards,
+         showcase = EXCLUDED.showcase
        RETURNING *`,
-      [targetId, nextNickname, body.email || null, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape]
+      [targetId, nextNickname, body.email || null, nextAvatar, nextBanner, nextBio, nextFav, nextFrame, nextShape, JSON.stringify(nextCards), JSON.stringify(nextShowcase)]
     );
 
     return res.json({ success: true, user: formatProfileRow(ins.rows[0]) });
@@ -658,3 +664,4 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+```[cite: 33, 35]
