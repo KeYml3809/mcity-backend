@@ -1061,34 +1061,57 @@ app.post('/api/admin/shop-banner', async (req, res) => {
   }
 });
 
-// --- Безопасный сброс пароля с подтверждением по 6-значному коду через Resend API ---
+// --- Безопасный сброс пароля с подтверждением по 6-значному коду через Brevo API ---
 const RESET_CODE_TTL_MS = 15 * 60 * 1000;
 const RESET_MAX_ATTEMPTS = 5;
 
-const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
-const MAIL_FROM = String(process.env.MAIL_FROM || 'Mcity <onboarding@resend.dev>').trim();
+const BREVO_API_KEY = String(process.env.BREVO_API_KEY || '').trim();
+const BREVO_SENDER_EMAIL = String(
+  process.env.BREVO_SENDER_EMAIL || process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || ''
+).trim();
+const BREVO_SENDER_NAME = String(process.env.BREVO_SENDER_NAME || 'Mcity').trim();
 
-async function sendResetCodeViaResend(toEmail, code) {
-  if (!RESEND_API_KEY) {
-    throw new Error('Resend не настроен: укажите RESEND_API_KEY в переменных окружения');
+function parseSenderFromEnv() {
+  const rawFrom = String(process.env.MAIL_FROM || '').trim();
+  const match = rawFrom.match(/^"?([^"<]+?)"?\s*<([^>]+)>$/);
+  if (match) {
+    return {
+      name: BREVO_SENDER_NAME || match[1].trim() || 'Mcity',
+      email: BREVO_SENDER_EMAIL || match[2].trim(),
+    };
+  }
+  return {
+    name: BREVO_SENDER_NAME || 'Mcity',
+    email: BREVO_SENDER_EMAIL || rawFrom,
+  };
+}
+
+async function sendResetCodeViaBrevo(toEmail, code) {
+  if (!BREVO_API_KEY) {
+    throw new Error('Brevo не настроен: укажите BREVO_API_KEY в переменных окружения');
   }
 
-  const fromHeader = MAIL_FROM.includes('<') ? MAIL_FROM : `Mcity <${MAIL_FROM}>`;
+  const sender = parseSenderFromEnv();
+  if (!sender.email || !sender.email.includes('@')) {
+    throw new Error('Не указан email отправителя: задайте BREVO_SENDER_EMAIL (подтверждённый отправитель в Brevo)');
+  }
 
-  const response = await fetch('https://api.resend.com/emails', {
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'api-key': BREVO_API_KEY,
       'Content-Type': 'application/json',
+      'Accept': 'application/json',
     },
     body: JSON.stringify({
-      from: fromHeader,
-      to: [toEmail],
+      sender: {
+        name: sender.name,
+        email: sender.email,
+      },
+      to: [{ email: toEmail }],
       subject: 'Код подтверждения сброса пароля — Mcity',
-      text: `Ваш код подтверждения для смены пароля на Mcity: ${code}
-
-Код действителен 15 минут. Если вы не запрашивали сброс пароля, просто проигнорируйте это письмо.`,
-      html: `
+      textContent: `Ваш код подтверждения для смены пароля на Mcity: ${code}\n\nКод действителен 15 минут. Если вы не запрашивали сброс пароля, просто проигнорируйте это письмо.`,
+      htmlContent: `
         <div style="font-family: Inter, Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px;">
           <h2 style="margin: 0 0 12px; color: #ef4444; font-size: 20px;">Mcity — Сброс пароля</h2>
           <p style="margin: 0 0 16px; color: #cbd5e1; font-size: 14px; line-height: 1.5;">
@@ -1107,7 +1130,7 @@ async function sendResetCodeViaResend(toEmail, code) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.message || data.error || `Ошибка Resend API (${response.status})`);
+    throw new Error(data.message || data.error || `Ошибка Brevo API (${response.status})`);
   }
 }
 
@@ -1164,7 +1187,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const codeHash = hashPasswordServer(code);
     const expiresAt = new Date(Date.now() + RESET_CODE_TTL_MS).toISOString();
 
-    await sendResetCodeViaResend(email, code);
+    await sendResetCodeViaBrevo(email, code);
 
     await pool.query(
       `UPDATE public.password_reset_tokens
