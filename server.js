@@ -1061,6 +1061,185 @@ app.post('/api/admin/shop-banner', async (req, res) => {
   }
 });
 
+// --- Безопасный сброс пароля с подтверждением по 6-значному коду ---
+const RESET_CODE_TTL_MS = 15 * 60 * 1000;
+const RESET_MAX_ATTEMPTS = 5;
+
+async function ensurePasswordResetTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.password_reset_tokens (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      email text NOT NULL,
+      user_id text,
+      code_hash text NOT NULL,
+      expires_at timestamptz NOT NULL,
+      attempts integer NOT NULL DEFAULT 0,
+      used boolean NOT NULL DEFAULT false,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function dispatchResetCodeToTelegramIfEnabled(email, code) {
+  const tgToken = String(process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+  const tgChat = String(process.env.TELEGRAM_STORAGE_CHAT_ID || process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '').trim();
+  if (tgToken && tgChat && process.env.SEND_RESET_CODE_TO_TG === 'true') {
+    try {
+      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: tgChat,
+          text: `🔐 Код подтверждения сброса пароля для ${email}: ${code} (действует 15 мин)`,
+        }),
+      });
+    } catch (_) {}
+  }
+}
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    await ensurePasswordResetTable();
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ success: false, error: 'Введите корректный email' });
+    }
+
+    const found = await findAuthUserAcrossTables({ email });
+    if (!found) {
+      return res.status(404).json({
+        success: false,
+        code: 'USER_NOT_FOUND',
+        error: 'Аккаунт с таким email не найден',
+      });
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const codeHash = hashPasswordServer(code);
+    const expiresAt = new Date(Date.now() + RESET_CODE_TTL_MS).toISOString();
+
+    await pool.query(
+      `UPDATE public.password_reset_tokens
+       SET used = true
+       WHERE lower(email) = $1 AND used = false`,
+      [email]
+    );
+
+    await pool.query(
+      `INSERT INTO public.password_reset_tokens (email, user_id, code_hash, expires_at, attempts, used)
+       VALUES ($1, $2, $3, $4, 0, false)`,
+      [email, String(found.id || found.userId || ''), codeHash, expiresAt]
+    );
+
+    await dispatchResetCodeToTelegramIfEnabled(email, code);
+
+    const responsePayload = {
+      success: true,
+      message: 'Код подтверждения создан и действует 15 минут',
+      expiresInSeconds: 900,
+    };
+    if (process.env.RESET_CODE_DEBUG === 'true') {
+      responsePayload.debugCode = code;
+    }
+
+    return res.json(responsePayload);
+  } catch (err) {
+    console.error('POST /api/auth/forgot-password:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка запроса кода сброса' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    await ensurePasswordResetTable();
+    const body = req.body || {};
+    const email = String(body.email || '').trim().toLowerCase();
+    const code = String(body.code || '').trim();
+    const newPassword = String(body.newPassword || body.password || '');
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Укажите email, код подтверждения и новый пароль' });
+    }
+    if (newPassword.length < 4) {
+      return res.status(400).json({ success: false, error: 'Новый пароль должен быть не короче 4 символов' });
+    }
+
+    const tokenRes = await pool.query(
+      `SELECT * FROM public.password_reset_tokens
+       WHERE lower(email) = $1 AND used = false
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email]
+    );
+
+    const tokenRow = tokenRes.rows[0];
+    if (!tokenRow) {
+      return res.status(400).json({ success: false, error: 'Активный код не найден. Запросите код заново.' });
+    }
+
+    if (new Date(tokenRow.expires_at).getTime() < Date.now()) {
+      await pool.query('UPDATE public.password_reset_tokens SET used = true WHERE id = $1', [tokenRow.id]);
+      return res.status(400).json({ success: false, error: 'Срок действия кода истёк. Запросите новый код.' });
+    }
+
+    if (Number(tokenRow.attempts || 0) >= RESET_MAX_ATTEMPTS) {
+      await pool.query('UPDATE public.password_reset_tokens SET used = true WHERE id = $1', [tokenRow.id]);
+      return res.status(429).json({ success: false, error: 'Превышено количество попыток. Запросите новый код.' });
+    }
+
+    if (String(tokenRow.code_hash) !== hashPasswordServer(code)) {
+      const nextAttempts = Number(tokenRow.attempts || 0) + 1;
+      await pool.query('UPDATE public.password_reset_tokens SET attempts = $1 WHERE id = $2', [nextAttempts, tokenRow.id]);
+      return res.status(401).json({
+        success: false,
+        error: `Неверный код подтверждения. Осталось попыток: ${Math.max(0, RESET_MAX_ATTEMPTS - nextAttempts)}`,
+      });
+    }
+
+    const found = await findAuthUserAcrossTables({ email, userId: tokenRow.user_id });
+    if (!found) {
+      return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+    }
+
+    const newPasswordHash = hashPasswordServer(newPassword);
+    await pool.query('UPDATE public.password_reset_tokens SET used = true WHERE id = $1', [tokenRow.id]);
+
+    try {
+      await pool.query(
+        'UPDATE public.users SET password_hash = $1 WHERE id::text = $2 OR lower(email) = $3',
+        [newPasswordHash, String(found.id), email]
+      );
+    } catch (_) {}
+
+    try {
+      await pool.query(
+        `INSERT INTO public.profiles (id, nickname, email, avatar_url, banner_url, cards, showcase)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+         ON CONFLICT (id) DO UPDATE SET
+           nickname = COALESCE(NULLIF(EXCLUDED.nickname, ''), public.profiles.nickname),
+           email = COALESCE(NULLIF(EXCLUDED.email, ''), public.profiles.email)`,
+        [
+          String(found.id),
+          found.nickname || found.username || email.split('@')[0],
+          email,
+          found.avatar || '/avatars/default.png',
+          found.banner || '/banners/default.png',
+          JSON.stringify(found.cards || []),
+          JSON.stringify(found.showcase || []),
+        ]
+      );
+    } catch (_) {}
+
+    return res.json({
+      success: true,
+      message: 'Пароль успешно изменён! Теперь вы можете войти с новым паролем.',
+    });
+  } catch (err) {
+    console.error('POST /api/auth/reset-password:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка смены пароля' });
+  }
+});
+
 // --- JSON 404 для всех неизвестных /api/* маршрутов ---
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
