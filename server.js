@@ -1085,7 +1085,7 @@ function getGmailTransporter() {
       secure: true,
       auth: {
         user: 'mcity.manga@gmail.com',
-        pass: fcisbxhuhsryhnfn,
+        pass: 'fcisbxhuhsryhnfn',
       },
     });
   }
