@@ -1,14 +1,33 @@
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const pool = require('../db'); // твой pg Pool / client
+const { Pool } = require('pg');
+require('dotenv').config();
 
-const router = express.Router();
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const uploadDir = path.join(__dirname, '..', 'uploads', 'banners');
-fs.mkdirSync(uploadDir, { recursive: true });
+// --- Подключение к PostgreSQL / Supabase ---
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false }
+    : undefined,
+});
 
+// --- Папка для загруженных баннеров и статика ---
+const uploadsRoot = path.join(__dirname, 'uploads');
+const bannersDir = path.join(uploadsRoot, 'banners');
+fs.mkdirSync(bannersDir, { recursive: true });
+
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use('/uploads', express.static(uploadsRoot));
+
+// --- Настройка Multer ---
 const ALLOWED_MIMES = {
   'image/gif': 'gif',
   'image/webp': 'image',
@@ -19,7 +38,7 @@ const ALLOWED_MIMES = {
 };
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
+  destination: (_req, _file, cb) => cb(null, bannersDir),
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || '.bin';
     const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
@@ -39,11 +58,39 @@ const upload = multer({
   },
 });
 
-// Получить текущий баннер для лавки и админки
-router.get('/api/shop/banner', async (_req, res) => {
+function uploadBannerMiddleware(req, res, next) {
+  upload.single('bannerFile')(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Файл слишком большой (максимум 25 МБ)' });
+      }
+      return res.status(400).json({ error: `Ошибка загрузки файла: ${err.message}` });
+    }
+    return res.status(400).json({ error: err.message || 'Ошибка загрузки файла' });
+  });
+}
+
+// --- Проверка статуса сервиса ---
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('GET /health:', err);
+    res.status(500).json({ ok: false, error: 'Database connection error' });
+  }
+});
+
+// --- Получить текущий баннер для лавки и админки ---
+app.get('/api/shop/banner', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, media_type, media_url, link_url, is_active, updated_at FROM shop_banners WHERE is_active = true ORDER BY id DESC LIMIT 1'
+      `SELECT id, media_type, media_url, link_url, is_active, updated_at
+       FROM shop_banners
+       WHERE is_active = true
+       ORDER BY id DESC
+       LIMIT 1`
     );
     res.json(rows[0] || null);
   } catch (err) {
@@ -52,17 +99,21 @@ router.get('/api/shop/banner', async (_req, res) => {
   }
 });
 
-// Обновить баннер из админки (загрузка нового файла или смена ссылки)
-router.put(
+// --- Обновить баннер из админки ---
+app.put(
   '/api/admin/shop/banner',
-  // сюда при необходимости подключи middleware проверки прав админа
-  upload.single('bannerFile'),
+  // при необходимости сюда можно добавить middleware проверки прав админа
+  uploadBannerMiddleware,
   async (req, res) => {
     try {
-      const { linkUrl = '' } = req.body;
+      const linkUrl = String(req.body?.linkUrl ?? '').trim();
 
       const currentRes = await pool.query(
-        'SELECT id, media_type, media_url FROM shop_banners WHERE is_active = true ORDER BY id DESC LIMIT 1'
+        `SELECT id, media_type, media_url
+         FROM shop_banners
+         WHERE is_active = true
+         ORDER BY id DESC
+         LIMIT 1`
       );
       const current = currentRes.rows[0];
 
@@ -73,10 +124,14 @@ router.put(
         mediaType = ALLOWED_MIMES[req.file.mimetype];
         mediaUrl = `/uploads/banners/${req.file.filename}`;
 
-        // Удаляем старый локальный файл, если он лежал в /uploads/banners/
+        // Удаляем старый локальный файл баннера, если он лежал в /uploads/banners/
         if (current?.media_url && current.media_url.startsWith('/uploads/banners/')) {
-          const oldPath = path.join(__dirname, '..', current.media_url);
-          fs.promises.unlink(oldPath).catch(() => {});
+          const relativeFile = current.media_url.replace(/^\/uploads\/banners\//, '');
+          const resolvedBannersDir = path.resolve(bannersDir);
+          const oldPath = path.resolve(bannersDir, relativeFile);
+          if (oldPath.startsWith(resolvedBannersDir + path.sep)) {
+            fs.promises.unlink(oldPath).catch(() => {});
+          }
         }
       }
 
@@ -91,7 +146,7 @@ router.put(
            SET media_type = $1, media_url = $2, link_url = $3, updated_at = NOW()
            WHERE id = $4
            RETURNING id, media_type, media_url, link_url, is_active, updated_at`,
-          [mediaType, mediaUrl, linkUrl.trim(), current.id]
+          [mediaType, mediaUrl, linkUrl, current.id]
         );
         saved = upd.rows[0];
       } else {
@@ -99,7 +154,7 @@ router.put(
           `INSERT INTO shop_banners (media_type, media_url, link_url, is_active)
            VALUES ($1, $2, $3, true)
            RETURNING id, media_type, media_url, link_url, is_active, updated_at`,
-          [mediaType, mediaUrl, linkUrl.trim()]
+          [mediaType, mediaUrl, linkUrl]
         );
         saved = ins.rows[0];
       }
@@ -112,4 +167,6 @@ router.put(
   }
 );
 
-module.exports = router;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
