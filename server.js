@@ -232,13 +232,14 @@ function parseBase64Payload(rawInput) {
   };
 }
 
-async function uploadBufferToTelegram(buffer, fileName, mimeType) {
+async function uploadBufferToTelegram(buffer, fileName, mimeType, options = {}) {
   if (!TG_BOT_TOKEN || !TG_STORAGE_CHAT_ID) return null;
 
-  const isVideo = /^video\//i.test(mimeType || '') || /\.(mp4|webm|mov)$/i.test(fileName || '');
-  const isImage = /^image\//i.test(mimeType || '') && !/gif/i.test(mimeType || '');
-  const endpoint = isVideo ? 'sendVideo' : (isImage ? 'sendPhoto' : 'sendDocument');
-  const fieldName = isVideo ? 'video' : (isImage ? 'photo' : 'document');
+  const forceDocument = Boolean(options && options.asDocument);
+  const isVideo = !forceDocument && (/^video\//i.test(mimeType || '') || /\.(mp4|webm|mov)$/i.test(fileName || ''));
+  const isImage = !forceDocument && /^image\//i.test(mimeType || '') && !/gif/i.test(mimeType || '');
+  const endpoint = forceDocument ? 'sendDocument' : (isVideo ? 'sendVideo' : (isImage ? 'sendPhoto' : 'sendDocument'));
+  const fieldName = forceDocument ? 'document' : (isVideo ? 'video' : (isImage ? 'photo' : 'document'));
 
   const form = new FormData();
   form.append('chat_id', TG_STORAGE_CHAT_ID);
@@ -266,7 +267,7 @@ async function uploadBufferToTelegram(buffer, fileName, mimeType) {
 
 app.post('/api/upload-page', async (req, res) => {
   try {
-    const { imageBase64, fileName } = req.body || {};
+    const { imageBase64, fileName, asDocument, sendAsDocument } = req.body || {};
     if (!imageBase64) {
       return res.status(400).json({ error: 'Missing imageBase64' });
     }
@@ -276,12 +277,20 @@ app.post('/api/upload-page', async (req, res) => {
       return res.status(400).json({ error: 'Invalid imageBase64 data' });
     }
 
-    const safeName = path.basename(String(fileName || `media_${Date.now()}.png`)).replace(/[^a-zA-Z0-9._-]/g, '_');
+    let safeName = path.basename(String(fileName || `media_${Date.now()}.png`)).replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (parsed.mimeType === 'image/png' && !/\.png$/i.test(safeName)) {
+      safeName = `${safeName}.png`;
+    }
+
+    // Подарки (и запросы с asDocument) отправляем в Telegram как файл (sendDocument), чтобы сохранить PNG и прозрачность
+    const shouldSendAsDocument = Boolean(asDocument || sendAsDocument) || /^gift_/i.test(safeName);
 
     let telegramFileId = null;
     if (TG_BOT_TOKEN && TG_STORAGE_CHAT_ID) {
       try {
-        telegramFileId = await uploadBufferToTelegram(parsed.buffer, safeName, parsed.mimeType);
+        telegramFileId = await uploadBufferToTelegram(parsed.buffer, safeName, parsed.mimeType, {
+          asDocument: shouldSendAsDocument,
+        });
       } catch (tgErr) {
         console.warn('POST /api/upload-page Telegram fallback:', tgErr.message || tgErr);
       }
@@ -401,7 +410,21 @@ app.get('/api/proxy-image', async (req, res) => {
       return res.status(404).json({ error: 'Failed to download file from Telegram' });
     }
 
-    const contentType = fileRes.headers.get('content-type') || 'application/octet-stream';
+    let contentType = fileRes.headers.get('content-type') || 'application/octet-stream';
+    if (!contentType || contentType === 'application/octet-stream') {
+      const ext = path.extname(String(infoJson.result.file_path || '')).toLowerCase();
+      const extMimeMap = {
+        '.png': 'image/png',
+        '.webp': 'image/webp',
+        '.gif': 'image/gif',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.svg': 'image/svg+xml',
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+      };
+      if (extMimeMap[ext]) contentType = extMimeMap[ext];
+    }
     const arrBuf = await fileRes.arrayBuffer();
     res.set('Content-Type', contentType);
     res.set('Cache-Control', 'public, max-age=86400');
