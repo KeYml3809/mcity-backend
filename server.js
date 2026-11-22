@@ -846,7 +846,19 @@ app.get('/api/user', async (req, res) => {
         query: req.query || {},
       });
     }
-    return res.json({ success: true, user: toPublicSessionUser(row) });
+    const pub = toPublicSessionUser(row);
+    try {
+      const inv = await getUserInventoryRecord(pub.id || pub.userId);
+      if (inv) {
+        pub.jesterCoins = inv.jesterCoins;
+        pub.bonusLevel = inv.bonusLevel;
+        pub.purchasedFrames = inv.purchasedFrames;
+        pub.purchasedShapes = inv.purchasedShapes;
+        pub.purchasedBgs = inv.purchasedBgs;
+        pub.equippedProfileBgId = inv.equippedProfileBgId;
+      }
+    } catch (_) {}
+    return res.json({ success: true, user: pub });
   } catch (err) {
     console.error('GET /api/user:', err);
     return res.status(500).json({ success: false, error: 'Database error loading user' });
@@ -890,7 +902,37 @@ app.get('/api/users', async (_req, res) => {
       }
     } catch (_) {}
 
-    return res.json(Array.from(byId.values()).map(toPublicSessionUser));
+    let invMap = new Map();
+    try {
+      await ensureUserInventoryTable();
+      const { rows: invRows } = await pool.query('SELECT * FROM public.user_inventory');
+      for (const r of invRows) {
+        if (r && r.user_id) invMap.set(String(r.user_id), normalizeInventoryRow(r));
+      }
+    } catch (_) {}
+
+    const resultList = Array.from(byId.values()).map((u) => {
+      const pub = toPublicSessionUser(u);
+      const inv = invMap.get(String(pub.id || pub.userId));
+      if (inv) {
+        pub.jesterCoins = inv.jesterCoins;
+        pub.bonusLevel = inv.bonusLevel;
+        pub.purchasedFrames = inv.purchasedFrames;
+        pub.purchasedShapes = inv.purchasedShapes;
+        pub.purchasedBgs = inv.purchasedBgs;
+        pub.equippedProfileBgId = inv.equippedProfileBgId;
+      } else {
+        pub.jesterCoins = Number(pub.jesterCoins || 0);
+        pub.bonusLevel = Number(pub.bonusLevel || 0);
+        pub.purchasedFrames = Array.isArray(pub.purchasedFrames) ? pub.purchasedFrames : [];
+        pub.purchasedShapes = Array.isArray(pub.purchasedShapes) ? pub.purchasedShapes : [];
+        pub.purchasedBgs = Array.isArray(pub.purchasedBgs) ? pub.purchasedBgs : [];
+        pub.equippedProfileBgId = pub.equippedProfileBgId || 'none';
+      }
+      return pub;
+    });
+
+    return res.json(resultList);
   } catch (err) {
     console.error('GET /api/users:', err);
     return res.json([]);
@@ -1454,7 +1496,7 @@ app.delete('/api/gifts/:giftId', async (req, res) => {
   }
 });
 
-// --- Синхронизация рамок аватара (включая прикреплённую форму аватарки avatar_shape) ---
+// --- Синхронизация рамок аватара (включая форму avatar_shape, цену price и флаг) ---
 let avatarFramesTableReady = false;
 async function ensureAvatarFramesTable() {
   if (avatarFramesTableReady) return;
@@ -1470,12 +1512,14 @@ async function ensureAvatarFramesTable() {
       frame_class TEXT DEFAULT '',
       vfx_html TEXT DEFAULT '',
       avatar_shape TEXT DEFAULT '',
+      price INTEGER NOT NULL DEFAULT 0,
+      flag TEXT DEFAULT '',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-  try {
-    await pool.query(`ALTER TABLE public.avatar_frames ADD COLUMN IF NOT EXISTS avatar_shape TEXT DEFAULT ''`);
-  } catch (_) {}
+  try { await pool.query(`ALTER TABLE public.avatar_frames ADD COLUMN IF NOT EXISTS avatar_shape TEXT DEFAULT ''`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE public.avatar_frames ADD COLUMN IF NOT EXISTS price INTEGER NOT NULL DEFAULT 0`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE public.avatar_frames ADD COLUMN IF NOT EXISTS flag TEXT DEFAULT ''`); } catch (_) {}
   avatarFramesTableReady = true;
 }
 
@@ -1483,12 +1527,20 @@ app.get('/api/avatar-frames', async (_req, res) => {
   try {
     await ensureAvatarFramesTable();
     const { rows } = await pool.query(
-      `SELECT id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, updated_at
+      `SELECT id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, price, flag, updated_at
        FROM public.avatar_frames
        ORDER BY min_level ASC, id ASC`
     );
+    let initialized = false;
+    try {
+      const initRes = await pool.query("SELECT url FROM public.settings WHERE key = 'avatar_frames_initialized' LIMIT 1");
+      initialized = Boolean(initRes.rows[0] && initRes.rows[0].url === 'true');
+    } catch (_) {}
+
+    const validShapes = new Set(['', 'circle', 'heart', 'square', 'cat']);
     return res.json({
       success: true,
+      initialized,
       frames: rows.map((row) => ({
         id: String(row.id),
         title: row.title || 'Рамка',
@@ -1499,7 +1551,9 @@ app.get('/api/avatar-frames', async (_req, res) => {
         image: row.image_url || '',
         frameClass: row.frame_class || '',
         vfxHTML: row.vfx_html || '',
-        avatarShape: row.avatar_shape || '',
+        avatarShape: validShapes.has(String(row.avatar_shape || '')) ? String(row.avatar_shape || '') : '',
+        price: Math.max(0, Math.floor(Number(row.price || 0))),
+        flag: row.flag || '',
       })),
     });
   } catch (err) {
@@ -1512,7 +1566,7 @@ app.put('/api/admin/avatar-frames', async (req, res) => {
   try {
     await ensureAvatarFramesTable();
     const frames = Array.isArray(req.body?.frames) ? req.body.frames : [];
-    const validShapes = new Set(['', 'circle', 'heart', 'star', 'square', 'cat']);
+    const validShapes = new Set(['', 'circle', 'heart', 'square', 'cat']);
     const cleanRows = frames
       .filter((f) => f && f.id && String(f.id) !== 'auto')
       .map((fr) => {
@@ -1528,6 +1582,8 @@ app.put('/api/admin/avatar-frames', async (req, res) => {
           frame_class: String(fr.frameClass || '').trim(),
           vfx_html: String(fr.vfxHTML || ''),
           avatar_shape: shape,
+          price: Math.max(0, Math.floor(Number(fr.price || 0))),
+          flag: String(fr.flag || '').trim(),
         };
       });
 
@@ -1541,8 +1597,8 @@ app.put('/api/admin/avatar-frames', async (req, res) => {
     for (const r of cleanRows) {
       await pool.query(
         `INSERT INTO public.avatar_frames
-           (id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+           (id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, price, flag, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
          ON CONFLICT (id) DO UPDATE SET
            title = EXCLUDED.title,
            category = EXCLUDED.category,
@@ -1553,15 +1609,309 @@ app.put('/api/admin/avatar-frames', async (req, res) => {
            frame_class = EXCLUDED.frame_class,
            vfx_html = EXCLUDED.vfx_html,
            avatar_shape = EXCLUDED.avatar_shape,
+           price = EXCLUDED.price,
+           flag = EXCLUDED.flag,
            updated_at = NOW()`,
-        [r.id, r.title, r.category, r.min_level, r.rule, r.badge, r.image_url, r.frame_class, r.vfx_html, r.avatar_shape]
+        [r.id, r.title, r.category, r.min_level, r.rule, r.badge, r.image_url, r.frame_class, r.vfx_html, r.avatar_shape, r.price, r.flag]
       );
     }
+
+    try {
+      await pool.query(
+        `INSERT INTO public.settings (key, url, type, updated_at)
+         VALUES ('avatar_frames_initialized', 'true', 'flag', NOW())
+         ON CONFLICT (key) DO UPDATE SET url = 'true', updated_at = NOW()`
+      );
+    } catch (_) {}
 
     return res.json({ success: true, count: cleanRows.length });
   } catch (err) {
     console.error('PUT /api/admin/avatar-frames:', err);
     return res.status(500).json({ success: false, error: 'Ошибка сохранения рамок аватара в БД' });
+  }
+});
+
+// --- Синхронизация инвентаря, монет, бонусного уровня, купленных/выданных рамок и форм (public.user_inventory) ---
+let userInventoryTableReady = false;
+async function ensureUserInventoryTable() {
+  if (userInventoryTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.user_inventory (
+      user_id TEXT PRIMARY KEY,
+      jester_coins INTEGER NOT NULL DEFAULT 0,
+      bonus_level INTEGER NOT NULL DEFAULT 0,
+      purchased_frames JSONB NOT NULL DEFAULT '[]'::jsonb,
+      purchased_shapes JSONB NOT NULL DEFAULT '[]'::jsonb,
+      purchased_bgs JSONB NOT NULL DEFAULT '[]'::jsonb,
+      equipped_profile_bg TEXT NOT NULL DEFAULT 'none',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  userInventoryTableReady = true;
+}
+
+function parseJsonStringArray(val) {
+  let arr = val;
+  if (typeof arr === 'string') {
+    try { arr = JSON.parse(arr); } catch (_) { arr = []; }
+  }
+  if (!Array.isArray(arr)) return [];
+  return Array.from(new Set(arr.map((x) => String(x || '').trim()).filter(Boolean)));
+}
+
+function normalizeInventoryRow(row, fallbackUserId = '') {
+  const validNonDefaultShapes = new Set(['heart', 'square', 'cat']);
+  if (!row) {
+    return {
+      userId: String(fallbackUserId || ''),
+      jesterCoins: 0,
+      bonusLevel: 0,
+      purchasedFrames: [],
+      purchasedShapes: [],
+      purchasedBgs: [],
+      equippedProfileBgId: 'none',
+    };
+  }
+  return {
+    userId: String(row.user_id || fallbackUserId || ''),
+    jesterCoins: Math.max(0, Math.floor(Number(row.jester_coins || 0))),
+    bonusLevel: Math.max(0, Math.min(100, Math.floor(Number(row.bonus_level || 0)))),
+    purchasedFrames: parseJsonStringArray(row.purchased_frames),
+    purchasedShapes: parseJsonStringArray(row.purchased_shapes).filter((s) => validNonDefaultShapes.has(s)),
+    purchasedBgs: parseJsonStringArray(row.purchased_bgs),
+    equippedProfileBgId: String(row.equipped_profile_bg || 'none'),
+  };
+}
+
+async function getUserInventoryRecord(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return normalizeInventoryRow(null, '');
+  await ensureUserInventoryTable();
+  const { rows } = await pool.query('SELECT * FROM public.user_inventory WHERE user_id = $1 LIMIT 1', [uid]);
+  return normalizeInventoryRow(rows[0] || null, uid);
+}
+
+async function upsertUserInventoryRecord(userId, patch = {}) {
+  const uid = String(userId || '').trim();
+  if (!uid) throw new Error('Missing userId');
+  await ensureUserInventoryTable();
+  const prev = await getUserInventoryRecord(uid);
+  const validNonDefaultShapes = new Set(['heart', 'square', 'cat']);
+
+  const nextCoins = patch.jesterCoins !== undefined
+    ? Math.max(0, Math.floor(Number(patch.jesterCoins || 0)))
+    : prev.jesterCoins;
+  const nextBonusLevel = patch.bonusLevel !== undefined
+    ? Math.max(0, Math.min(100, Math.floor(Number(patch.bonusLevel || 0))))
+    : prev.bonusLevel;
+  const nextFrames = patch.purchasedFrames !== undefined
+    ? parseJsonStringArray(patch.purchasedFrames)
+    : prev.purchasedFrames;
+  const nextShapes = patch.purchasedShapes !== undefined
+    ? parseJsonStringArray(patch.purchasedShapes).filter((s) => validNonDefaultShapes.has(s))
+    : prev.purchasedShapes;
+  const nextBgs = patch.purchasedBgs !== undefined
+    ? parseJsonStringArray(patch.purchasedBgs)
+    : prev.purchasedBgs;
+  const nextBgId = patch.equippedProfileBgId !== undefined
+    ? String(patch.equippedProfileBgId || 'none')
+    : prev.equippedProfileBgId;
+
+  const { rows } = await pool.query(
+    `INSERT INTO public.user_inventory
+       (user_id, jester_coins, bonus_level, purchased_frames, purchased_shapes, purchased_bgs, equipped_profile_bg, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET
+       jester_coins = EXCLUDED.jester_coins,
+       bonus_level = EXCLUDED.bonus_level,
+       purchased_frames = EXCLUDED.purchased_frames,
+       purchased_shapes = EXCLUDED.purchased_shapes,
+       purchased_bgs = EXCLUDED.purchased_bgs,
+       equipped_profile_bg = EXCLUDED.equipped_profile_bg,
+       updated_at = NOW()
+     RETURNING *`,
+    [uid, nextCoins, nextBonusLevel, JSON.stringify(nextFrames), JSON.stringify(nextShapes), JSON.stringify(nextBgs), nextBgId]
+  );
+
+  return normalizeInventoryRow(rows[0], uid);
+}
+
+app.get('/api/user-inventory/:userId', async (req, res) => {
+  try {
+    const uid = String(req.params.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Missing userId' });
+    const inv = await getUserInventoryRecord(uid);
+    return res.json({ success: true, inventory: inv });
+  } catch (err) {
+    console.error('GET /api/user-inventory/:userId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки инвентаря пользователя' });
+  }
+});
+
+app.patch('/api/user-inventory/:userId', async (req, res) => {
+  try {
+    const uid = String(req.params.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Missing userId' });
+    const inv = await upsertUserInventoryRecord(uid, req.body || {});
+    return res.json({ success: true, inventory: inv });
+  } catch (err) {
+    console.error('PATCH /api/user-inventory/:userId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения инвентаря пользователя' });
+  }
+});
+
+app.post('/api/admin/user-grant', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const uid = String(body.userId || '').trim();
+    if (!uid) return res.status(400).json({ success: false, error: 'Не указан userId пользователя' });
+
+    const currentInv = await getUserInventoryRecord(uid);
+    const patch = {};
+
+    if (body.setCoins !== undefined && body.setCoins !== null) {
+      patch.jesterCoins = Math.max(0, Math.floor(Number(body.setCoins) || 0));
+    } else if (body.addCoins !== undefined && body.addCoins !== null) {
+      patch.jesterCoins = Math.max(0, currentInv.jesterCoins + Math.floor(Number(body.addCoins) || 0));
+    }
+
+    if (body.setBonusLevel !== undefined && body.setBonusLevel !== null) {
+      patch.bonusLevel = Math.max(0, Math.min(100, Math.floor(Number(body.setBonusLevel) || 0)));
+    } else if (body.addLevel !== undefined && body.addLevel !== null) {
+      patch.bonusLevel = Math.max(0, Math.min(100, currentInv.bonusLevel + Math.floor(Number(body.addLevel) || 0)));
+    }
+
+    const framesSet = new Set(currentInv.purchasedFrames);
+    if (body.grantFrameId) framesSet.add(String(body.grantFrameId).trim());
+    if (body.revokeFrameId) framesSet.delete(String(body.revokeFrameId).trim());
+    if (Array.isArray(body.purchasedFrames)) {
+      patch.purchasedFrames = body.purchasedFrames;
+    } else if (body.grantFrameId || body.revokeFrameId) {
+      patch.purchasedFrames = Array.from(framesSet);
+    }
+
+    const shapesSet = new Set(currentInv.purchasedShapes);
+    if (body.grantShapeId) shapesSet.add(String(body.grantShapeId).trim());
+    if (body.revokeShapeId) shapesSet.delete(String(body.revokeShapeId).trim());
+    if (Array.isArray(body.purchasedShapes)) {
+      patch.purchasedShapes = body.purchasedShapes;
+    } else if (body.grantShapeId || body.revokeShapeId) {
+      patch.purchasedShapes = Array.from(shapesSet);
+    }
+
+    const updatedInv = await upsertUserInventoryRecord(uid, patch);
+
+    let updatedCards = null;
+    if (body.grantCard && typeof body.grantCard === 'object') {
+      const existingUser = await findAuthUserAcrossTables({
+        userId: uid,
+        email: body.userHint?.email,
+        publicId: body.userHint?.publicId,
+      });
+      const currentCards = Array.isArray(existingUser?.cards)
+        ? [...existingUser.cards]
+        : (Array.isArray(body.currentCards) ? [...body.currentCards] : []);
+
+      const newCardInstance = {
+        ...body.grantCard,
+        uid: body.grantCard.uid || `admin_grant_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      };
+      currentCards.push(newCardInstance);
+
+      await syncUserAndProfileRecord({
+        ...(existingUser || {}),
+        id: uid,
+        nickname: existingUser?.nickname || body.userHint?.nickname || 'Пользователь',
+        email: existingUser?.email || body.userHint?.email || '',
+        publicId: existingUser?.publicId || body.userHint?.publicId || generatePublicIdServer(uid),
+        avatar: existingUser?.avatar || body.userHint?.avatar || '/avatars/default.png',
+        banner: existingUser?.banner || body.userHint?.banner || '/banners/default.png',
+        cards: currentCards,
+      });
+      updatedCards = currentCards;
+    }
+
+    return res.json({
+      success: true,
+      inventory: updatedInv,
+      cards: updatedCards,
+    });
+  } catch (err) {
+    console.error('POST /api/admin/user-grant:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка выдачи наград пользователю' });
+  }
+});
+
+// --- Конфигурация цен Лавки (формы аватара и фоны профиля) ---
+let shopConfigTableReady = false;
+async function ensureShopConfigTable() {
+  if (shopConfigTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.shop_config (
+      key TEXT PRIMARY KEY,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  shopConfigTableReady = true;
+}
+
+app.get('/api/shop-config', async (_req, res) => {
+  try {
+    await ensureShopConfigTable();
+    const { rows } = await pool.query('SELECT key, data FROM public.shop_config');
+    const cfg = {};
+    for (const r of rows) {
+      let parsed = r.data;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (_) { parsed = {}; }
+      }
+      cfg[String(r.key)] = parsed;
+    }
+    return res.json({
+      success: true,
+      shapePrices: cfg.shape_prices || null,
+      backgrounds: Array.isArray(cfg.backgrounds) ? cfg.backgrounds : null,
+    });
+  } catch (err) {
+    console.error('GET /api/shop-config:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки конфигурации Лавки' });
+  }
+});
+
+app.put('/api/admin/shop-config', async (req, res) => {
+  try {
+    await ensureShopConfigTable();
+    const body = req.body || {};
+
+    if (body.shapePrices && typeof body.shapePrices === 'object') {
+      const cleanPrices = {
+        circle: 0,
+        heart: Math.max(0, Math.floor(Number(body.shapePrices.heart ?? 150) || 0)),
+        square: Math.max(0, Math.floor(Number(body.shapePrices.square ?? 100) || 0)),
+        cat: Math.max(0, Math.floor(Number(body.shapePrices.cat ?? 200) || 0)),
+      };
+      await pool.query(
+        `INSERT INTO public.shop_config (key, data, updated_at)
+         VALUES ('shape_prices', $1::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+        [JSON.stringify(cleanPrices)]
+      );
+    }
+
+    if (Array.isArray(body.backgrounds)) {
+      await pool.query(
+        `INSERT INTO public.shop_config (key, data, updated_at)
+         VALUES ('backgrounds', $1::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+        [JSON.stringify(body.backgrounds)]
+      );
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('PUT /api/admin/shop-config:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения конфигурации Лавки' });
   }
 });
 
