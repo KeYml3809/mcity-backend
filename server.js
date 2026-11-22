@@ -135,15 +135,66 @@ app.get('/api/external/proxy', async (req, res) => {
   }
 });
 
-// --- Маршруты друзей и пользователей (JSON-ответы вместо HTML 404) ---
-app.get('/api/friends', async (_req, res) => {
-  return res.json({ friends: [], incoming: [], outgoing: [] });
+// --- Синхронизация друзей и заявок из таблицы friends / friend_requests ---
+app.get('/api/friends', async (req, res) => {
+  try {
+    const userId = String(req.query.userId || '').trim();
+    if (!userId) {
+      return res.json({ friends: [], incoming: [], outgoing: [] });
+    }
+
+    const friendsRes = await pool.query(
+      `SELECT user_id, friend_id, created_at
+       FROM friends
+       WHERE user_id = $1 OR friend_id = $1
+       ORDER BY created_at DESC NULLS LAST`,
+      [userId]
+    );
+
+    const friendIds = Array.from(
+      new Set(
+        friendsRes.rows.map((row) =>
+          String(row.user_id) === userId ? String(row.friend_id) : String(row.user_id)
+        )
+      )
+    );
+
+    const incomingRes = await pool.query(
+      `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
+              receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
+              status, created_at
+       FROM friend_requests
+       WHERE receiver_id = $1 AND status = 'pending'
+       ORDER BY created_at DESC NULLS LAST`,
+      [userId]
+    );
+
+    const outgoingRes = await pool.query(
+      `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
+              receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
+              status, created_at
+       FROM friend_requests
+       WHERE sender_id = $1 AND status = 'pending'
+       ORDER BY created_at DESC NULLS LAST`,
+      [userId]
+    );
+
+    return res.json({
+      friends: friendIds,
+      incoming: incomingRes.rows,
+      outgoing: outgoingRes.rows,
+    });
+  } catch (err) {
+    console.error('GET /api/friends:', err);
+    return res.status(500).json({ error: 'Ошибка загрузки списка друзей' });
+  }
 });
 
+// --- Пользователи (JSON-ответы вместо HTML 404) ---
 app.get('/api/user', async (req, res) => {
   const { userId, publicId, email } = req.query;
   return res.status(404).json({
-    error: 'User endpoint is not configured on backend',
+    error: 'User profile table is not mapped on backend',
     query: { userId, publicId, email },
   });
 });
