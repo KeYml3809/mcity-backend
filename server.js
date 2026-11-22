@@ -280,10 +280,14 @@ app.post('/api/upload-page', async (req, res) => {
     let safeName = path.basename(String(fileName || `media_${Date.now()}.png`)).replace(/[^a-zA-Z0-9._-]/g, '_');
     if (parsed.mimeType === 'image/png' && !/\.png$/i.test(safeName)) {
       safeName = `${safeName}.png`;
+    } else if (parsed.mimeType === 'image/webp' && !/\.webp$/i.test(safeName)) {
+      safeName = `${safeName}.webp`;
     }
 
-    // Подарки (и запросы с asDocument) отправляем в Telegram как файл (sendDocument), чтобы сохранить PNG и прозрачность
-    const shouldSendAsDocument = Boolean(asDocument || sendAsDocument) || /^gift_/i.test(safeName);
+    // Подарки, рамки (аватара, карточек, категорий) и запросы с asDocument отправляем в Telegram как файл (sendDocument), чтобы сохранить PNG и прозрачный фон
+    const shouldSendAsDocument =
+      Boolean(asDocument || sendAsDocument) ||
+      /^(gift|avatar_frame|card_frame|frame)_/i.test(safeName);
 
     let telegramFileId = null;
     if (TG_BOT_TOKEN && TG_STORAGE_CHAT_ID) {
@@ -1334,6 +1338,230 @@ app.post('/api/auth/reset-password', async (req, res) => {
   } catch (err) {
     console.error('POST /api/auth/reset-password:', err);
     return res.status(500).json({ success: false, error: 'Ошибка смены пароля' });
+  }
+});
+
+// --- Синхронизация подарков пользователей через БД (public.user_gifts) ---
+let userGiftsTableReady = false;
+async function ensureUserGiftsTable() {
+  if (userGiftsTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.user_gifts (
+      id TEXT PRIMARY KEY,
+      target_user_id TEXT NOT NULL,
+      from_user_id TEXT DEFAULT '',
+      from_nickname TEXT DEFAULT 'Читатель',
+      item JSONB NOT NULL DEFAULT '{}'::jsonb,
+      note TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_user_gifts_target_created
+    ON public.user_gifts (target_user_id, created_at DESC)
+  `);
+  userGiftsTableReady = true;
+}
+
+function normalizeGiftRow(row) {
+  if (!row) return null;
+  let itemObj = row.item;
+  if (typeof itemObj === 'string') {
+    try { itemObj = JSON.parse(itemObj); } catch (_) { itemObj = {}; }
+  }
+  return {
+    id: String(row.id),
+    targetUserId: String(row.target_user_id || ''),
+    fromUserId: String(row.from_user_id || ''),
+    fromNickname: row.from_nickname || 'Читатель',
+    item: (itemObj && typeof itemObj === 'object') ? itemObj : {},
+    note: row.note || '',
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+  };
+}
+
+app.get('/api/gifts/:userId', async (req, res) => {
+  try {
+    await ensureUserGiftsTable();
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) {
+      return res.json({ success: true, gifts: [] });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, target_user_id, from_user_id, from_nickname, item, note, created_at
+       FROM public.user_gifts
+       WHERE target_user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      [userId]
+    );
+    return res.json({
+      success: true,
+      gifts: rows.map(normalizeGiftRow).filter(Boolean),
+    });
+  } catch (err) {
+    console.error('GET /api/gifts/:userId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки подарков пользователя' });
+  }
+});
+
+app.post('/api/gifts', async (req, res) => {
+  try {
+    await ensureUserGiftsTable();
+    const body = req.body || {};
+    const targetUserId = String(body.targetUserId || body.target_user_id || '').trim();
+    const fromUserId = String(body.fromUserId || body.from_user_id || '').trim();
+    const fromNickname = String(body.fromNickname || body.from_nickname || 'Читатель').trim();
+    const item = body.item && typeof body.item === 'object' ? body.item : null;
+    const note = String(body.note || '').trim().slice(0, 300);
+    const id = String(body.id || `gift_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`).trim();
+    const createdAt = body.createdAt || body.created_at || new Date().toISOString();
+
+    if (!targetUserId || !item) {
+      return res.status(400).json({ success: false, error: 'Не указан получатель или предмет подарка' });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO public.user_gifts (id, target_user_id, from_user_id, from_nickname, item, note, created_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         item = EXCLUDED.item,
+         note = EXCLUDED.note
+       RETURNING id, target_user_id, from_user_id, from_nickname, item, note, created_at`,
+      [id, targetUserId, fromUserId, fromNickname, JSON.stringify(item), note, createdAt]
+    );
+
+    return res.status(201).json({
+      success: true,
+      gift: normalizeGiftRow(rows[0]),
+    });
+  } catch (err) {
+    console.error('POST /api/gifts:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения подарка в БД' });
+  }
+});
+
+app.delete('/api/gifts/:giftId', async (req, res) => {
+  try {
+    await ensureUserGiftsTable();
+    const giftId = String(req.params.giftId || '').trim();
+    if (!giftId) return res.status(400).json({ success: false, error: 'Missing giftId' });
+    await pool.query('DELETE FROM public.user_gifts WHERE id = $1', [giftId]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/gifts/:giftId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка удаления подарка' });
+  }
+});
+
+// --- Синхронизация рамок аватара (включая прикреплённую форму аватарки avatar_shape) ---
+let avatarFramesTableReady = false;
+async function ensureAvatarFramesTable() {
+  if (avatarFramesTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.avatar_frames (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT 'Рамка',
+      category TEXT NOT NULL DEFAULT 'levels',
+      min_level INTEGER NOT NULL DEFAULT 1,
+      rule TEXT DEFAULT '',
+      badge TEXT DEFAULT '',
+      image_url TEXT DEFAULT '',
+      frame_class TEXT DEFAULT '',
+      vfx_html TEXT DEFAULT '',
+      avatar_shape TEXT DEFAULT '',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  try {
+    await pool.query(`ALTER TABLE public.avatar_frames ADD COLUMN IF NOT EXISTS avatar_shape TEXT DEFAULT ''`);
+  } catch (_) {}
+  avatarFramesTableReady = true;
+}
+
+app.get('/api/avatar-frames', async (_req, res) => {
+  try {
+    await ensureAvatarFramesTable();
+    const { rows } = await pool.query(
+      `SELECT id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, updated_at
+       FROM public.avatar_frames
+       ORDER BY min_level ASC, id ASC`
+    );
+    return res.json({
+      success: true,
+      frames: rows.map((row) => ({
+        id: String(row.id),
+        title: row.title || 'Рамка',
+        category: row.category || 'levels',
+        minLevel: Number(row.min_level || 1),
+        rule: row.rule || '',
+        badge: row.badge || '',
+        image: row.image_url || '',
+        frameClass: row.frame_class || '',
+        vfxHTML: row.vfx_html || '',
+        avatarShape: row.avatar_shape || '',
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/avatar-frames:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки рамок аватара' });
+  }
+});
+
+app.put('/api/admin/avatar-frames', async (req, res) => {
+  try {
+    await ensureAvatarFramesTable();
+    const frames = Array.isArray(req.body?.frames) ? req.body.frames : [];
+    const validShapes = new Set(['', 'circle', 'heart', 'star', 'square', 'cat']);
+    const cleanRows = frames
+      .filter((f) => f && f.id && String(f.id) !== 'auto')
+      .map((fr) => {
+        const shape = validShapes.has(String(fr.avatarShape || '')) ? String(fr.avatarShape || '') : '';
+        return {
+          id: String(fr.id),
+          title: String(fr.title || 'Рамка').trim(),
+          category: String(fr.category || 'levels').trim(),
+          min_level: Math.max(1, Math.min(100, Number(fr.minLevel || 1))),
+          rule: String(fr.rule || '').trim(),
+          badge: String(fr.badge || '').trim(),
+          image_url: String(fr.image || '').trim(),
+          frame_class: String(fr.frameClass || '').trim(),
+          vfx_html: String(fr.vfxHTML || ''),
+          avatar_shape: shape,
+        };
+      });
+
+    const keepIds = cleanRows.map((r) => r.id);
+    if (keepIds.length > 0) {
+      await pool.query('DELETE FROM public.avatar_frames WHERE NOT (id = ANY($1::text[]))', [keepIds]);
+    } else {
+      await pool.query('DELETE FROM public.avatar_frames');
+    }
+
+    for (const r of cleanRows) {
+      await pool.query(
+        `INSERT INTO public.avatar_frames
+           (id, title, category, min_level, rule, badge, image_url, frame_class, vfx_html, avatar_shape, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         ON CONFLICT (id) DO UPDATE SET
+           title = EXCLUDED.title,
+           category = EXCLUDED.category,
+           min_level = EXCLUDED.min_level,
+           rule = EXCLUDED.rule,
+           badge = EXCLUDED.badge,
+           image_url = EXCLUDED.image_url,
+           frame_class = EXCLUDED.frame_class,
+           vfx_html = EXCLUDED.vfx_html,
+           avatar_shape = EXCLUDED.avatar_shape,
+           updated_at = NOW()`,
+        [r.id, r.title, r.category, r.min_level, r.rule, r.badge, r.image_url, r.frame_class, r.vfx_html, r.avatar_shape]
+      );
+    }
+
+    return res.json({ success: true, count: cleanRows.length });
+  } catch (err) {
+    console.error('PUT /api/admin/avatar-frames:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения рамок аватара в БД' });
   }
 });
 
