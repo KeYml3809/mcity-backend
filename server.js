@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -1061,9 +1062,67 @@ app.post('/api/admin/shop-banner', async (req, res) => {
   }
 });
 
-// --- Безопасный сброс пароля с подтверждением по 6-значному коду ---
+// --- Безопасный сброс пароля с подтверждением по 6-значному коду через Gmail ---
 const RESET_CODE_TTL_MS = 15 * 60 * 1000;
 const RESET_MAX_ATTEMPTS = 5;
+
+const GMAIL_USER = String(process.env.GMAIL_USER || process.env.SMTP_USER || '').trim();
+const GMAIL_APP_PASSWORD = String(
+  process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_PASS || process.env.SMTP_PASS || ''
+).replace(/\s+/g, '');
+const MAIL_FROM = String(process.env.MAIL_FROM || GMAIL_USER || 'Mcity <noreply@mcity.local>').trim();
+
+let gmailTransporter = null;
+function getGmailTransporter() {
+  if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
+    return null;
+  }
+  if (!gmailTransporter) {
+    gmailTransporter = nodemailer.createTransport({
+      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: {
+        user: mcity.manga@gmail.com,
+        pass: fcisbxhuhsryhnfn,
+      },
+    });
+  }
+  return gmailTransporter;
+}
+
+async function sendResetCodeViaGmail(toEmail, code) {
+  const transporter = getGmailTransporter();
+  if (!transporter) {
+    throw new Error('Gmail SMTP не настроен: укажите GMAIL_USER и GMAIL_APP_PASSWORD в переменных окружения');
+  }
+
+  const mailOptions = {
+    from: MAIL_FROM.includes('<') ? MAIL_FROM : `"Mcity" <${GMAIL_USER}>`,
+    to: toEmail,
+    subject: 'Код подтверждения сброса пароля — Mcity',
+    text: `Ваш код подтверждения для смены пароля на Mcity: ${code}
+
+Код действителен 15 минут. Если вы не запрашивали сброс пароля, просто проигнорируйте это письмо.`,
+    html: `
+      <div style="font-family: Inter, Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px;">
+        <h2 style="margin: 0 0 12px; color: #ef4444; font-size: 20px;">Mcity — Сброс пароля</h2>
+        <p style="margin: 0 0 16px; color: #cbd5e1; font-size: 14px; line-height: 1.5;">
+          Вы запросили восстановление пароля. Введите этот 6-значный код подтверждения в окне на сайте:
+        </p>
+        <div style="font-size: 28px; font-weight: 800; letter-spacing: 6px; text-align: center; padding: 14px; margin: 16px 0; background: #1e293b; border: 1px solid #334155; border-radius: 12px; color: #fbbf24;">
+          ${code}
+        </div>
+        <p style="margin: 0; color: #94a3b8; font-size: 12px; line-height: 1.5;">
+          Код действует <strong>15 минут</strong>. Если это были не вы — просто проигнорируйте письмо.
+        </p>
+      </div>
+    `,
+  };
+
+  await transporter.sendMail(mailOptions);
+}
 
 async function ensurePasswordResetTable() {
   await pool.query(`
@@ -1118,6 +1177,8 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const codeHash = hashPasswordServer(code);
     const expiresAt = new Date(Date.now() + RESET_CODE_TTL_MS).toISOString();
 
+    await sendResetCodeViaGmail(email, code);
+
     await pool.query(
       `UPDATE public.password_reset_tokens
        SET used = true
@@ -1135,7 +1196,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     const responsePayload = {
       success: true,
-      message: 'Код подтверждения создан и действует 15 минут',
+      message: 'Код подтверждения отправлен на ваш email (действует 15 минут)',
       expiresInSeconds: 900,
     };
     if (process.env.RESET_CODE_DEBUG === 'true') {
@@ -1145,7 +1206,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     return res.json(responsePayload);
   } catch (err) {
     console.error('POST /api/auth/forgot-password:', err);
-    return res.status(500).json({ success: false, error: 'Ошибка запроса кода сброса' });
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Ошибка отправки кода подтверждения на email',
+    });
   }
 });
 
