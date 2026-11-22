@@ -425,7 +425,7 @@ app.get('/api/user', async (req, res) => {
 
 app.get('/api/users', async (_req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM profiles ORDER BY created_at DESC NULLS LAST LIMIT 200');
+    const { rows } = await pool.query('SELECT * FROM profiles ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200');
     return res.json(rows.map(formatProfileRow));
   } catch (err) {
     console.error('GET /api/users:', err);
