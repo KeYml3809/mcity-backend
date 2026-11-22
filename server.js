@@ -1084,7 +1084,7 @@ function getGmailTransporter() {
       port: 465,
       secure: true,
       auth: {
-        user: mcity.manga@gmail.com,
+        user: 'mcity.manga@gmail.com',
         pass: fcisbxhuhsryhnfn,
       },
     });
