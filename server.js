@@ -108,9 +108,14 @@ const ALLOWED_PROXY_HOSTS = new Set([
   'uploads.mangadex.org',
 ]);
 
+function isAllowedProxyHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return ALLOWED_PROXY_HOSTS.has(host) || host.endsWith('.mangadex.network') || host.endsWith('.mangadex.org');
+}
+
 app.get('/api/external/proxy', async (req, res) => {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), 18000);
 
   try {
     const rawUrl = String(req.query.url || '').trim();
@@ -129,7 +134,7 @@ app.get('/api/external/proxy', async (req, res) => {
       return res.status(400).json({ error: 'Unsupported protocol' });
     }
 
-    if (!ALLOWED_PROXY_HOSTS.has(parsedUrl.hostname)) {
+    if (!isAllowedProxyHost(parsedUrl.hostname)) {
       return res.status(403).json({ error: 'Host is not allowed' });
     }
 
@@ -137,16 +142,20 @@ app.get('/api/external/proxy', async (req, res) => {
       signal: controller.signal,
       headers: {
         'User-Agent': 'McityMangaLibrary/1.0 (contact@mcity.local)',
-        'Accept': 'application/json, text/plain, */*',
+        'Accept': 'application/json, image/webp, image/png, image/jpeg, */*',
+        'Referer': 'https://mangadex.org/',
       },
     });
 
-    const contentType = upstreamRes.headers.get('content-type') || 'application/json; charset=utf-8';
-    const bodyText = await upstreamRes.text();
+    const contentType = upstreamRes.headers.get('content-type') || 'application/octet-stream';
+    const arrBuf = await upstreamRes.arrayBuffer();
 
     res.status(upstreamRes.status);
     res.set('Content-Type', contentType);
-    return res.send(bodyText);
+    if (contentType.startsWith('image/')) {
+      res.set('Cache-Control', 'public, max-age=86400');
+    }
+    return res.send(Buffer.from(arrBuf));
   } catch (err) {
     console.error('GET /api/external/proxy:', err);
     return res.status(502).json({ error: 'External proxy request failed' });
@@ -2241,21 +2250,74 @@ async function ensureShopConfigTable() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  try {
+    await pool.query(`ALTER TABLE public.shop_config ADD COLUMN IF NOT EXISTS key TEXT`);
+    await pool.query(`ALTER TABLE public.shop_config ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb`);
+    await pool.query(`ALTER TABLE public.shop_config ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_config_key_unique ON public.shop_config (key) WHERE key IS NOT NULL`);
+  } catch (e) {
+    console.warn('ensureShopConfigTable alter:', e.message || e);
+  }
   shopConfigTableReady = true;
+}
+
+async function readShopConfigByKeys(keysList = null) {
+  await ensureShopConfigTable();
+  const cfg = {};
+  try {
+    const query = Array.isArray(keysList) && keysList.length > 0
+      ? 'SELECT key, data FROM public.shop_config WHERE key = ANY($1::text[])'
+      : 'SELECT key, data FROM public.shop_config WHERE key IS NOT NULL';
+    const params = Array.isArray(keysList) && keysList.length > 0 ? [keysList] : [];
+    const { rows } = await pool.query(query, params);
+    for (const r of rows) {
+      let parsed = r.data;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (_) { parsed = null; }
+      }
+      cfg[String(r.key)] = parsed;
+    }
+  } catch (err) {
+    if (err && (err.code === '42703' || err.code === '42P01')) {
+      console.warn('shop_config fallback due to schema mismatch:', err.message || err.code);
+      return cfg;
+    }
+    throw err;
+  }
+  return cfg;
+}
+
+async function upsertShopConfigEntry(keyName, valueObj) {
+  await ensureShopConfigTable();
+  const payload = JSON.stringify(valueObj);
+  try {
+    await pool.query(
+      `INSERT INTO public.shop_config (key, data, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+      [keyName, payload]
+    );
+  } catch (err) {
+    if (err && err.code === '42P10') {
+      const upd = await pool.query(
+        `UPDATE public.shop_config SET data = $2::jsonb, updated_at = NOW() WHERE key = $1`,
+        [keyName, payload]
+      );
+      if (upd.rowCount === 0) {
+        await pool.query(
+          `INSERT INTO public.shop_config (key, data, updated_at) VALUES ($1, $2::jsonb, NOW())`,
+          [keyName, payload]
+        );
+      }
+      return;
+    }
+    throw err;
+  }
 }
 
 app.get('/api/shop-config', async (_req, res) => {
   try {
-    await ensureShopConfigTable();
-    const { rows } = await pool.query('SELECT key, data FROM public.shop_config');
-    const cfg = {};
-    for (const r of rows) {
-      let parsed = r.data;
-      if (typeof parsed === 'string') {
-        try { parsed = JSON.parse(parsed); } catch (_) { parsed = {}; }
-      }
-      cfg[String(r.key)] = parsed;
-    }
+    const cfg = await readShopConfigByKeys(['shape_prices', 'backgrounds']);
     return res.json({
       success: true,
       shapePrices: cfg.shape_prices || null,
@@ -2263,13 +2325,12 @@ app.get('/api/shop-config', async (_req, res) => {
     });
   } catch (err) {
     console.error('GET /api/shop-config:', err);
-    return res.status(500).json({ success: false, error: 'Ошибка загрузки конфигурации Лавки' });
+    return res.json({ success: true, shapePrices: null, backgrounds: null });
   }
 });
 
 app.put('/api/admin/shop-config', async (req, res) => {
   try {
-    await ensureShopConfigTable();
     const body = req.body || {};
 
     if (body.shapePrices && typeof body.shapePrices === 'object') {
@@ -2279,21 +2340,11 @@ app.put('/api/admin/shop-config', async (req, res) => {
         square: Math.max(0, Math.floor(Number(body.shapePrices.square ?? 100) || 0)),
         cat: Math.max(0, Math.floor(Number(body.shapePrices.cat ?? 200) || 0)),
       };
-      await pool.query(
-        `INSERT INTO public.shop_config (key, data, updated_at)
-         VALUES ('shape_prices', $1::jsonb, NOW())
-         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [JSON.stringify(cleanPrices)]
-      );
+      await upsertShopConfigEntry('shape_prices', cleanPrices);
     }
 
     if (Array.isArray(body.backgrounds)) {
-      await pool.query(
-        `INSERT INTO public.shop_config (key, data, updated_at)
-         VALUES ('backgrounds', $1::jsonb, NOW())
-         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [JSON.stringify(body.backgrounds)]
-      );
+      await upsertShopConfigEntry('backgrounds', body.backgrounds);
     }
 
     return res.json({ success: true });
@@ -2306,18 +2357,7 @@ app.put('/api/admin/shop-config', async (req, res) => {
 // --- Конфигурация уровней и внешности титулов ---
 app.get('/api/level-config', async (_req, res) => {
   try {
-    await ensureShopConfigTable();
-    const { rows } = await pool.query(
-      "SELECT key, data FROM public.shop_config WHERE key IN ('level_settings', 'level_titles')"
-    );
-    const cfg = {};
-    for (const r of rows) {
-      let parsed = r.data;
-      if (typeof parsed === 'string') {
-        try { parsed = JSON.parse(parsed); } catch (_) { parsed = null; }
-      }
-      cfg[String(r.key)] = parsed;
-    }
+    const cfg = await readShopConfigByKeys(['level_settings', 'level_titles']);
     return res.json({
       success: true,
       levelSettings: cfg.level_settings || null,
@@ -2325,31 +2365,20 @@ app.get('/api/level-config', async (_req, res) => {
     });
   } catch (err) {
     console.error('GET /api/level-config:', err);
-    return res.status(500).json({ success: false, error: 'Ошибка загрузки настроек уровней' });
+    return res.json({ success: true, levelSettings: null, levelTitles: null });
   }
 });
 
 app.put('/api/admin/level-config', async (req, res) => {
   try {
-    await ensureShopConfigTable();
     const body = req.body || {};
 
     if (body.levelSettings && typeof body.levelSettings === 'object') {
-      await pool.query(
-        `INSERT INTO public.shop_config (key, data, updated_at)
-         VALUES ('level_settings', $1::jsonb, NOW())
-         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [JSON.stringify(body.levelSettings)]
-      );
+      await upsertShopConfigEntry('level_settings', body.levelSettings);
     }
 
     if (Array.isArray(body.levelTitles)) {
-      await pool.query(
-        `INSERT INTO public.shop_config (key, data, updated_at)
-         VALUES ('level_titles', $1::jsonb, NOW())
-         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [JSON.stringify(body.levelTitles)]
-      );
+      await upsertShopConfigEntry('level_titles', body.levelTitles);
     }
 
     return res.json({ success: true });
