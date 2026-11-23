@@ -156,57 +156,248 @@ app.get('/api/external/proxy', async (req, res) => {
 });
 
 // --- Синхронизация друзей и заявок из таблицы friends / friend_requests ---
+let friendsTablesReady = false;
+async function ensureFriendsTables() {
+  if (friendsTablesReady) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.friends (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        friend_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+  } catch (e) {
+    console.warn('ensureFriendsTables friends:', e.message || e);
+  }
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.friend_requests (
+        id BIGSERIAL PRIMARY KEY,
+        sender_id TEXT NOT NULL,
+        sender_nickname TEXT DEFAULT 'Пользователь',
+        sender_avatar TEXT DEFAULT '',
+        sender_public_id TEXT DEFAULT '',
+        receiver_id TEXT NOT NULL,
+        receiver_nickname TEXT DEFAULT 'Пользователь',
+        receiver_avatar TEXT DEFAULT '',
+        receiver_public_id TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+  } catch (e) {
+    console.warn('ensureFriendsTables friend_requests:', e.message || e);
+  }
+  friendsTablesReady = true;
+}
+
 app.get('/api/friends', async (req, res) => {
   try {
-    const userId = String(req.query.userId || '').trim();
+    await ensureFriendsTables();
+    let userId = String(req.query.userId || '').trim();
+    if (!userId && (req.query.email || req.query.publicId)) {
+      const found = await findAuthUserAcrossTables({
+        email: req.query.email,
+        publicId: req.query.publicId,
+      });
+      if (found && found.id) userId = String(found.id);
+    }
     if (!userId) {
-      return res.json({ friends: [], incoming: [], outgoing: [] });
+      return res.json({ success: true, friends: [], friendIds: [], incoming: [], outgoing: [] });
     }
 
     const friendsRes = await pool.query(
       `SELECT user_id, friend_id, created_at
-       FROM friends
-       WHERE user_id = $1 OR friend_id = $1
+       FROM public.friends
+       WHERE user_id::text = $1 OR friend_id::text = $1
        ORDER BY created_at DESC NULLS LAST`,
       [userId]
     );
 
     const friendIds = Array.from(
       new Set(
-        friendsRes.rows.map((row) =>
-          String(row.user_id) === userId ? String(row.friend_id) : String(row.user_id)
-        )
+        friendsRes.rows
+          .map((row) =>
+            String(row.user_id) === userId ? String(row.friend_id) : String(row.user_id)
+          )
+          .filter((id) => id && id !== userId)
       )
     );
 
-    const incomingRes = await pool.query(
-      `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
-              receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
-              status, created_at
-       FROM friend_requests
-       WHERE receiver_id = $1 AND status = 'pending'
-       ORDER BY created_at DESC NULLS LAST`,
-      [userId]
-    );
+    // Также учитываем принятые заявки на случай, если запись была только в friend_requests
+    try {
+      const acceptedReqRes = await pool.query(
+        `SELECT sender_id, receiver_id
+         FROM public.friend_requests
+         WHERE (sender_id::text = $1 OR receiver_id::text = $1) AND status = 'accepted'`,
+        [userId]
+      );
+      for (const r of acceptedReqRes.rows) {
+        const otherId = String(r.sender_id) === userId ? String(r.receiver_id) : String(r.sender_id);
+        if (otherId && otherId !== userId && !friendIds.includes(otherId)) {
+          friendIds.push(otherId);
+        }
+      }
+    } catch (_) {}
 
-    const outgoingRes = await pool.query(
-      `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
-              receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
-              status, created_at
-       FROM friend_requests
-       WHERE sender_id = $1 AND status = 'pending'
-       ORDER BY created_at DESC NULLS LAST`,
-      [userId]
-    );
+    const friendsDetailed = [];
+    for (const fid of friendIds) {
+      try {
+        const u = await findAuthUserAcrossTables({ userId: fid });
+        friendsDetailed.push({
+          userId: fid,
+          nickname: (u && (u.nickname || u.username)) || 'Пользователь',
+          avatar: (u && u.avatar) || '',
+          banner: (u && u.banner) || '',
+          publicId: (u && u.publicId) || '',
+        });
+      } catch (_) {
+        friendsDetailed.push({
+          userId: fid,
+          nickname: 'Пользователь',
+          avatar: '',
+          banner: '',
+          publicId: '',
+        });
+      }
+    }
+
+    let incomingRows = [];
+    let outgoingRows = [];
+    try {
+      const incomingRes = await pool.query(
+        `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
+                receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
+                status, created_at
+         FROM public.friend_requests
+         WHERE receiver_id::text = $1 AND status = 'pending'
+         ORDER BY created_at DESC NULLS LAST`,
+        [userId]
+      );
+      incomingRows = incomingRes.rows || [];
+
+      const outgoingRes = await pool.query(
+        `SELECT id, sender_id, sender_nickname, sender_avatar, sender_public_id,
+                receiver_id, receiver_nickname, receiver_avatar, receiver_public_id,
+                status, created_at
+         FROM public.friend_requests
+         WHERE sender_id::text = $1 AND status = 'pending'
+         ORDER BY created_at DESC NULLS LAST`,
+        [userId]
+      );
+      outgoingRows = outgoingRes.rows || [];
+    } catch (_) {}
 
     return res.json({
-      friends: friendIds,
-      incoming: incomingRes.rows,
-      outgoing: outgoingRes.rows,
+      success: true,
+      friends: friendsDetailed,
+      friendIds,
+      incoming: incomingRows,
+      outgoing: outgoingRows,
     });
   } catch (err) {
     console.error('GET /api/friends:', err);
-    return res.status(500).json({ error: 'Ошибка загрузки списка друзей' });
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки списка друзей' });
+  }
+});
+
+app.post('/api/friends/accept', async (req, res) => {
+  try {
+    await ensureFriendsTables();
+    const body = req.body || {};
+    let myId = String(body.userId || body.id || '').trim();
+    if (!myId && (body.email || body.publicId)) {
+      const found = await findAuthUserAcrossTables({ email: body.email, publicId: body.publicId });
+      if (found && found.id) myId = String(found.id);
+    }
+    const friendId = String(body.friendId || body.senderId || body.sender_id || '').trim();
+    const requestId = body.requestId ? String(body.requestId).trim() : '';
+
+    if (!myId || !friendId) {
+      return res.status(400).json({ success: false, error: 'Не указаны идентификаторы пользователей' });
+    }
+    if (myId === friendId) {
+      return res.status(400).json({ success: false, error: 'Нельзя добавить самого себя в друзья' });
+    }
+
+    const existsRes = await pool.query(
+      `SELECT 1 FROM public.friends
+       WHERE (user_id::text = $1 AND friend_id::text = $2)
+          OR (user_id::text = $2 AND friend_id::text = $1)
+       LIMIT 1`,
+      [myId, friendId]
+    );
+
+    if (existsRes.rows.length === 0) {
+      await pool.query(
+        `INSERT INTO public.friends (user_id, friend_id, created_at)
+         VALUES ($1, $2, NOW())`,
+        [myId, friendId]
+      );
+    }
+
+    try {
+      if (requestId) {
+        await pool.query(
+          `UPDATE public.friend_requests SET status = 'accepted' WHERE id::text = $1`,
+          [requestId]
+        );
+      }
+      await pool.query(
+        `UPDATE public.friend_requests
+         SET status = 'accepted'
+         WHERE (sender_id::text = $1 AND receiver_id::text = $2)
+            OR (sender_id::text = $2 AND receiver_id::text = $1)`,
+        [friendId, myId]
+      );
+    } catch (e) {
+      console.warn('POST /api/friends/accept update friend_requests:', e.message || e);
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/friends/accept:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка подтверждения дружбы' });
+  }
+});
+
+app.delete('/api/friends/:targetId', async (req, res) => {
+  try {
+    await ensureFriendsTables();
+    const targetId = String(req.params.targetId || '').trim();
+    const body = req.body || {};
+    let myId = String(body.userId || body.id || req.query.userId || '').trim();
+    if (!myId && (body.email || body.publicId)) {
+      const found = await findAuthUserAcrossTables({ email: body.email, publicId: body.publicId });
+      if (found && found.id) myId = String(found.id);
+    }
+
+    if (!myId || !targetId) {
+      return res.status(400).json({ success: false, error: 'Не указаны идентификаторы пользователей' });
+    }
+
+    await pool.query(
+      `DELETE FROM public.friends
+       WHERE (user_id::text = $1 AND friend_id::text = $2)
+          OR (user_id::text = $2 AND friend_id::text = $1)`,
+      [myId, targetId]
+    );
+
+    try {
+      await pool.query(
+        `DELETE FROM public.friend_requests
+         WHERE (sender_id::text = $1 AND receiver_id::text = $2)
+            OR (sender_id::text = $2 AND receiver_id::text = $1)`,
+        [myId, targetId]
+      );
+    } catch (_) {}
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/friends/:targetId:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка удаления из друзей' });
   }
 });
 
@@ -2165,6 +2356,156 @@ app.put('/api/admin/level-config', async (req, res) => {
   } catch (err) {
     console.error('PUT /api/admin/level-config:', err);
     return res.status(500).json({ success: false, error: 'Ошибка сохранения настроек уровней' });
+  }
+});
+
+// --- Управление администраторами (назначение и снятие роли admin) ---
+const PRIMARY_OWNER_EMAIL = 'rozavetoga@gmail.com';
+
+async function getAdminUsersConfig() {
+  await ensureShopConfigTable();
+  const emailsSet = new Set([PRIMARY_OWNER_EMAIL]);
+  const userIdsSet = new Set();
+
+  try {
+    const { rows } = await pool.query("SELECT data FROM public.shop_config WHERE key = 'admin_users' LIMIT 1");
+    if (rows[0] && rows[0].data) {
+      let parsed = rows[0].data;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (_) { parsed = {}; }
+      }
+      if (Array.isArray(parsed.emails)) {
+        parsed.emails.forEach((e) => {
+          const clean = String(e || '').trim().toLowerCase();
+          if (clean) emailsSet.add(clean);
+        });
+      }
+      if (Array.isArray(parsed.userIds)) {
+        parsed.userIds.forEach((id) => {
+          const clean = String(id || '').trim();
+          if (clean) userIdsSet.add(clean);
+        });
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const { rows: adminRows } = await pool.query("SELECT id, email FROM public.users WHERE lower(role) = 'admin'");
+    for (const r of adminRows) {
+      if (r.id) userIdsSet.add(String(r.id));
+      if (r.email) emailsSet.add(String(r.email).trim().toLowerCase());
+    }
+  } catch (_) {}
+
+  return {
+    emails: Array.from(emailsSet),
+    userIds: Array.from(userIdsSet),
+  };
+}
+
+async function saveAdminUsersConfig(cfg) {
+  await ensureShopConfigTable();
+  const emails = Array.from(new Set([
+    PRIMARY_OWNER_EMAIL,
+    ...(Array.isArray(cfg.emails) ? cfg.emails.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean) : []),
+  ]));
+  const userIds = Array.from(new Set(
+    Array.isArray(cfg.userIds) ? cfg.userIds.map((id) => String(id || '').trim()).filter(Boolean) : []
+  ));
+  await pool.query(
+    `INSERT INTO public.shop_config (key, data, updated_at)
+     VALUES ('admin_users', $1::jsonb, NOW())
+     ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+    [JSON.stringify({ emails, userIds })]
+  );
+  return { emails, userIds };
+}
+
+app.get('/api/admin/admins', async (_req, res) => {
+  try {
+    const cfg = await getAdminUsersConfig();
+    return res.json({ success: true, ...cfg });
+  } catch (err) {
+    console.error('GET /api/admin/admins:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки списка администраторов' });
+  }
+});
+
+app.post('/api/admin/set-role', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const targetRole = String(body.role || 'user').trim().toLowerCase() === 'admin' ? 'admin' : 'user';
+    const rawUserId = String(body.userId || body.id || '').trim();
+    const rawEmail = String(body.email || '').trim().toLowerCase();
+    const rawQuery = String(body.query || body.nickname || body.publicId || '').trim();
+
+    let found = null;
+    if (rawUserId || rawEmail || rawQuery) {
+      found = await findAuthUserAcrossTables({
+        userId: rawUserId,
+        email: rawEmail || (rawQuery.includes('@') ? rawQuery.toLowerCase() : ''),
+        publicId: /^MC-/i.test(rawQuery) ? rawQuery : '',
+        nickname: (!rawQuery.includes('@') && !/^MC-/i.test(rawQuery)) ? rawQuery : '',
+        username: (!rawQuery.includes('@') && !/^MC-/i.test(rawQuery)) ? rawQuery.toLowerCase() : '',
+      });
+    }
+
+    const finalUid = String((found && found.id) || rawUserId || '').trim();
+    const finalEmail = String((found && found.email) || rawEmail || (rawQuery.includes('@') ? rawQuery.toLowerCase() : '')).trim().toLowerCase();
+
+    if (!finalUid && !finalEmail) {
+      return res.status(404).json({ success: false, error: 'Пользователь не найден. Укажите корректный email, ник или ID.' });
+    }
+
+    if (finalEmail === PRIMARY_OWNER_EMAIL && targetRole !== 'admin') {
+      return res.status(400).json({ success: false, error: 'Нельзя снять права у главного администратора.' });
+    }
+
+    // Обновляем role в public.users
+    try {
+      if (finalUid && finalEmail) {
+        await pool.query(
+          'UPDATE public.users SET role = $1 WHERE id::text = $2 OR lower(email) = $3',
+          [targetRole, finalUid, finalEmail]
+        );
+      } else if (finalUid) {
+        await pool.query('UPDATE public.users SET role = $1 WHERE id::text = $2', [targetRole, finalUid]);
+      } else if (finalEmail) {
+        await pool.query('UPDATE public.users SET role = $1 WHERE lower(email) = $2', [targetRole, finalEmail]);
+      }
+    } catch (e) {
+      console.warn('POST /api/admin/set-role users update:', e.message || e);
+    }
+
+    // Обновляем глобальный конфиг admin_users
+    const cfg = await getAdminUsersConfig();
+    const emailsSet = new Set(cfg.emails);
+    const idsSet = new Set(cfg.userIds);
+
+    if (targetRole === 'admin') {
+      if (finalEmail) emailsSet.add(finalEmail);
+      if (finalUid) idsSet.add(finalUid);
+    } else {
+      if (finalEmail && finalEmail !== PRIMARY_OWNER_EMAIL) emailsSet.delete(finalEmail);
+      if (finalUid) idsSet.delete(finalUid);
+    }
+
+    const savedCfg = await saveAdminUsersConfig({
+      emails: Array.from(emailsSet),
+      userIds: Array.from(idsSet),
+    });
+
+    return res.json({
+      success: true,
+      role: targetRole,
+      userId: finalUid,
+      email: finalEmail,
+      nickname: found?.nickname || '',
+      admins: savedCfg,
+    });
+  } catch (err) {
+    console.error('POST /api/admin/set-role:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка изменения роли пользователя' });
   }
 });
 
