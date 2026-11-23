@@ -2112,6 +2112,62 @@ app.put('/api/admin/shop-config', async (req, res) => {
   }
 });
 
+// --- Конфигурация уровней и внешности титулов ---
+app.get('/api/level-config', async (_req, res) => {
+  try {
+    await ensureShopConfigTable();
+    const { rows } = await pool.query(
+      "SELECT key, data FROM public.shop_config WHERE key IN ('level_settings', 'level_titles')"
+    );
+    const cfg = {};
+    for (const r of rows) {
+      let parsed = r.data;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (_) { parsed = null; }
+      }
+      cfg[String(r.key)] = parsed;
+    }
+    return res.json({
+      success: true,
+      levelSettings: cfg.level_settings || null,
+      levelTitles: Array.isArray(cfg.level_titles) ? cfg.level_titles : null,
+    });
+  } catch (err) {
+    console.error('GET /api/level-config:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка загрузки настроек уровней' });
+  }
+});
+
+app.put('/api/admin/level-config', async (req, res) => {
+  try {
+    await ensureShopConfigTable();
+    const body = req.body || {};
+
+    if (body.levelSettings && typeof body.levelSettings === 'object') {
+      await pool.query(
+        `INSERT INTO public.shop_config (key, data, updated_at)
+         VALUES ('level_settings', $1::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+        [JSON.stringify(body.levelSettings)]
+      );
+    }
+
+    if (Array.isArray(body.levelTitles)) {
+      await pool.query(
+        `INSERT INTO public.shop_config (key, data, updated_at)
+         VALUES ('level_titles', $1::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+        [JSON.stringify(body.levelTitles)]
+      );
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('PUT /api/admin/level-config:', err);
+    return res.status(500).json({ success: false, error: 'Ошибка сохранения настроек уровней' });
+  }
+});
+
 // --- JSON 404 для всех неизвестных /api/* маршрутов ---
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
