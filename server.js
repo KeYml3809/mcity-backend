@@ -2538,6 +2538,599 @@ app.post('/api/admin/set-role', async (req, res) => {
   }
 });
 
+
+// ============================================================================
+// АВТОМАТИЧЕСКИЙ ИМПОРТ МАНГИ И ГЛАВ С ИСТОЧНИКОВ В TELEGRAM И БД (Mcity)
+// ============================================================================
+const MANGADEX_IMPORT_API = 'https://api.mangadex.org';
+const AUTO_IMPORT_ENABLED = String(process.env.AUTO_IMPORT_ENABLED || 'true').toLowerCase() !== 'false';
+const AUTO_IMPORT_INTERVAL_MS = Math.max(5 * 60 * 1000, Number(process.env.AUTO_IMPORT_INTERVAL_MS || (60 * 60 * 1000))); // по умолчанию раз в 1 час
+const AUTO_IMPORT_INITIAL_DELAY_MS = Math.max(5000, Number(process.env.AUTO_IMPORT_INITIAL_DELAY_MS || 20000));
+const AUTO_IMPORT_TITLES_PER_RUN = Math.max(1, Number(process.env.AUTO_IMPORT_TITLES_PER_RUN || 3));
+const AUTO_IMPORT_MAX_CHAPTERS_PER_RUN = Math.max(1, Number(process.env.AUTO_IMPORT_MAX_CHAPTERS_PER_RUN || 10));
+const AUTO_IMPORT_LANGS = String(process.env.IMPORT_LANGS || 'ru,en')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+const AUTO_IMPORT_RU_DICTIONARY = {
+  'solo leveling': 'Поднятие уровня в одиночку',
+  'tower of god': 'Башня Бога',
+  'omniscient reader': 'Точка зрения Всеведущего Читателя',
+  'chainsaw man': 'Человек-бензопила',
+  'jujutsu kaisen': 'Магическая битва',
+  'one piece': 'Ван-Пис',
+  'berserk': 'Берсерк',
+  'vagabond': 'Бродяга',
+  'vinland saga': 'Сага о Винланде',
+  'demon slayer': 'Клинок, рассекающий демонов',
+  'spy x family': 'Семья шпиона',
+  'tokyo ghoul': 'Токийский гуль',
+  'lookism': 'Лукизм',
+  'eleceed': 'Элисед',
+  'the beginning after the end': 'Начало После Конца',
+  'nano machine': 'Нано-машина',
+  'apothecary diaries': 'Монолог фармацевта',
+  'frieren': 'Провожающая в последний путь Фрирен',
+  'dandadan': 'Дандадан',
+  'blue lock': 'Синяя тюрьма: Блю Лок',
+  'attack on titan': 'Атака титанов',
+  'hunter x hunter': 'Охотник х Охотник',
+  'naruto': 'Наруто',
+  'bleach': 'Блич',
+  'death note': 'Тетрадь смерти',
+  'one-punch man': 'Ванпанчмен',
+  'the eminence in shadow': 'Восхождение в тени',
+  'that time i got reincarnated as a slime': 'О моём перерождении в слизь'
+};
+
+let isAutoImportRunning = false;
+let autoImportLastRunAt = null;
+let autoImportLastSummary = null;
+
+const importSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const importHasRussian = (str) => /[а-яА-ЯёЁ]/.test(String(str || ''));
+const importHasUkrainian = (str) => /[іІїЇєЄґҐ]/.test(String(str || ''));
+const importNormalizeKey = (str) =>
+  String(str || '')
+    .toLowerCase()
+    .replace(/\[.*?\]|\(.*?\)/g, '')
+    .replace(/[^a-zа-яё0-9]+/gi, ' ')
+    .trim();
+
+function resolveImportMangaTitle(candidates, fallback = 'Untitled Manga') {
+  const clean = (Array.isArray(candidates) ? candidates : [])
+    .filter((v) => typeof v === 'string' && v.trim())
+    .map((v) => v.trim());
+
+  for (const c of clean) {
+    if (importHasRussian(c) && !importHasUkrainian(c)) return c;
+  }
+  for (const c of clean) {
+    if (importHasUkrainian(c)) continue;
+    const lower = c.toLowerCase();
+    if (AUTO_IMPORT_RU_DICTIONARY[lower]) return AUTO_IMPORT_RU_DICTIONARY[lower];
+    for (const [eng, ru] of Object.entries(AUTO_IMPORT_RU_DICTIONARY)) {
+      if (lower.includes(eng)) return ru;
+    }
+  }
+  for (const c of clean) {
+    if (!importHasUkrainian(c) && /[a-zA-Z]/.test(c)) return c;
+  }
+  return fallback;
+}
+
+async function ensureMangaImportSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.mangas (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        author TEXT DEFAULT '',
+        cover TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        is_hidden BOOLEAN DEFAULT FALSE,
+        tags JSONB DEFAULT '[]'::jsonb,
+        chapters_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.chapters (
+        id BIGSERIAL PRIMARY KEY,
+        manga_id TEXT NOT NULL,
+        chapter_number INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        pages JSONB DEFAULT '[]'::jsonb,
+        source_library TEXT DEFAULT 'MangaDex',
+        page_sources JSONB DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (manga_id, chapter_number)
+      )
+    `);
+    await pool.query(`ALTER TABLE public.chapters ADD COLUMN IF NOT EXISTS source_library TEXT DEFAULT 'MangaDex'`).catch(() => {});
+    await pool.query(`ALTER TABLE public.chapters ADD COLUMN IF NOT EXISTS page_sources JSONB DEFAULT '[]'::jsonb`).catch(() => {});
+  } catch (err) {
+    console.warn('[AutoImport] Проверка схемы mangas/chapters:', err.message || err);
+  }
+}
+
+async function importFetchJson(url, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'McityServerAutoImporter/1.0',
+          'Accept': 'application/json',
+        },
+      });
+      if (res.status === 429) {
+        await importSleep(2000 * attempt);
+        continue;
+      }
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await importSleep(1000 * attempt);
+    }
+  }
+}
+
+async function mirrorRemoteImageToTelegramStorage(imageUrl, safeFileName) {
+  if (!imageUrl) return '';
+  if (imageUrl.includes('/api/proxy-image') || imageUrl.includes('t.me/')) {
+    return imageUrl;
+  }
+
+  const imgRes = await fetch(imageUrl, {
+    headers: {
+      'User-Agent': 'McityServerAutoImporter/1.0',
+      'Referer': 'https://mangadex.org/',
+    },
+  });
+  if (!imgRes.ok) {
+    throw new Error(`Download failed (${imgRes.status})`);
+  }
+  const mimeType = imgRes.headers.get('content-type') || 'image/jpeg';
+  const buffer = Buffer.from(await imgRes.arrayBuffer());
+  if (!buffer || buffer.length === 0) {
+    throw new Error('Empty image buffer');
+  }
+
+  const cleanName = path.basename(String(safeFileName || `page_${Date.now()}.jpg`)).replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  if (TG_BOT_TOKEN && TG_STORAGE_CHAT_ID) {
+    const tgFileId = await uploadBufferToTelegram(buffer, cleanName, mimeType, { asDocument: false });
+    if (tgFileId) {
+      return `/api/proxy-image?file_id=${encodeURIComponent(tgFileId)}`;
+    }
+  }
+
+  // Запасное сохранение на диск, если Telegram временно недоступен
+  const diskName = `${Date.now()}-${Math.round(Math.random() * 1e9)}-${cleanName}`;
+  await fs.promises.writeFile(path.join(tgMediaDir, diskName), buffer);
+  return `/uploads/tg-media/${diskName}`;
+}
+
+async function searchMangaOnMangaDex(query = '', limit = 5) {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  params.append('includes[]', 'cover_art');
+  params.append('includes[]', 'author');
+  params.append('contentRating[]', 'safe');
+  params.append('contentRating[]', 'suggestive');
+  params.append('contentRating[]', 'erotica');
+  if (query && String(query).trim()) {
+    params.set('title', String(query).trim());
+  } else {
+    params.set('order[followedCount]', 'desc');
+  }
+  const json = await importFetchJson(`${MANGADEX_IMPORT_API}/manga?${params.toString()}`);
+  return Array.isArray(json?.data) ? json.data : [];
+}
+
+function normalizeMangaDexMeta(raw) {
+  const attrs = raw?.attributes || {};
+  const titleObj = attrs.title || {};
+  const altTitles = Array.isArray(attrs.altTitles)
+    ? attrs.altTitles.flatMap((obj) =>
+        Object.entries(obj || {})
+          .filter(([k]) => k.toLowerCase() !== 'uk')
+          .map(([, v]) => v)
+      )
+    : [];
+  const safeTitleVals = Object.entries(titleObj)
+    .filter(([k]) => k.toLowerCase() !== 'uk')
+    .map(([, v]) => v);
+
+  const title = resolveImportMangaTitle(
+    [titleObj.ru, ...altTitles, titleObj.en, ...safeTitleVals],
+    titleObj.en || 'Untitled Manga'
+  );
+
+  const descObj = attrs.description || {};
+  const description =
+    descObj.ru && !importHasUkrainian(descObj.ru) ? descObj.ru : descObj.en || '';
+
+  const rels = Array.isArray(raw?.relationships) ? raw.relationships : [];
+  const authorRel = rels.find((r) => r.type === 'author');
+  const author = authorRel?.attributes?.name || 'MangaDex';
+
+  const coverRel = rels.find((r) => r.type === 'cover_art');
+  const coverFile = coverRel?.attributes?.fileName;
+  const coverUrl = coverFile
+    ? `https://uploads.mangadex.org/covers/${raw.id}/${coverFile}.512.jpg`
+    : '';
+
+  const tags = Array.isArray(attrs.tags)
+    ? attrs.tags
+        .map((t) => t?.attributes?.name?.ru || t?.attributes?.name?.en || '')
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+
+  return {
+    sourceId: String(raw.id),
+    title,
+    allCandidateTitles: [title, titleObj.ru, titleObj.en, ...altTitles].filter(Boolean),
+    author,
+    coverUrl,
+    description: String(description || '').trim(),
+    tags,
+  };
+}
+
+async function findOrCreateImportedManga(meta) {
+  const { rows: existingList } = await pool.query(
+    `SELECT id, title, cover, author, description FROM public.mangas`
+  );
+  const candidateKeys = new Set(meta.allCandidateTitles.map(importNormalizeKey).filter(Boolean));
+
+  const matched = existingList.find((row) => {
+    if (String(row.id) === `ext_${meta.sourceId}` || String(row.id) === meta.sourceId) return true;
+    const rowKey = importNormalizeKey(row.title);
+    return rowKey && candidateKeys.has(rowKey);
+  });
+
+  if (matched) {
+    return matched;
+  }
+
+  let storedCover = meta.coverUrl;
+  if (meta.coverUrl) {
+    try {
+      storedCover = await mirrorRemoteImageToTelegramStorage(
+        meta.coverUrl,
+        `cover_${meta.sourceId}_${Date.now()}.jpg`
+      );
+    } catch (_) {}
+  }
+
+  const newMangaId = `ext_${meta.sourceId}`;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO public.mangas (id, title, author, cover, description, is_hidden, tags)
+       VALUES ($1, $2, $3, $4, $5, FALSE, $6::jsonb)
+       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title
+       RETURNING id, title, cover, author, description`,
+      [
+        newMangaId,
+        meta.title,
+        meta.author,
+        storedCover,
+        meta.description || 'Импортировано автоматически из MangaDex.',
+        JSON.stringify(meta.tags || []),
+      ]
+    );
+    return rows[0] || { id: newMangaId, title: meta.title };
+  } catch (_) {
+    const { rows } = await pool.query(
+      `INSERT INTO public.mangas (id, title, author, cover, description)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title
+       RETURNING id, title, cover, author, description`,
+      [
+        newMangaId,
+        meta.title,
+        meta.author,
+        storedCover,
+        meta.description || 'Импортировано автоматически из MangaDex.',
+      ]
+    );
+    return rows[0] || { id: newMangaId, title: meta.title };
+  }
+}
+
+async function fetchAnalyzedChaptersFromSource(sourceMangaId) {
+  const allRaw = [];
+  let offset = 0;
+  const pageSize = 100;
+
+  while (true) {
+    const params = new URLSearchParams();
+    params.set('limit', String(pageSize));
+    params.set('offset', String(offset));
+    params.set('order[chapter]', 'asc');
+    params.set('order[volume]', 'asc');
+    for (const lang of AUTO_IMPORT_LANGS) {
+      params.append('translatedLanguage[]', lang);
+    }
+    params.append('contentRating[]', 'safe');
+    params.append('contentRating[]', 'suggestive');
+    params.append('contentRating[]', 'erotica');
+
+    const json = await importFetchJson(
+      `${MANGADEX_IMPORT_API}/manga/${encodeURIComponent(sourceMangaId)}/feed?${params.toString()}`
+    );
+    const batch = Array.isArray(json?.data) ? json.data : [];
+    allRaw.push(...batch);
+    if (batch.length < pageSize || allRaw.length >= 400) break;
+    offset += pageSize;
+    await importSleep(300);
+  }
+
+  const grouped = new Map();
+  for (const ch of allRaw) {
+    const attr = ch?.attributes || {};
+    if (attr.externalUrl && Number(attr.pages || 0) === 0) continue;
+
+    const rawLang = String(attr.translatedLanguage || '').toLowerCase();
+    const lang = rawLang === 'ru' ? 'ru' : rawLang === 'en' ? 'en' : rawLang;
+    if (!AUTO_IMPORT_LANGS.includes(lang)) continue;
+
+    const chapNum =
+      attr.chapter !== null && attr.chapter !== undefined && String(attr.chapter).trim() !== ''
+        ? String(attr.chapter).trim()
+        : String(ch.id);
+
+    const key = `${chapNum}__${lang}`;
+    if (!grouped.has(key)) {
+      const badge = lang === 'ru' ? '[RU]' : '[EN]';
+      const cleanChTitle = attr.title && !importHasUkrainian(attr.title) ? `: ${attr.title}` : '';
+      grouped.set(key, {
+        externalChapterId: ch.id,
+        chapterNumber: chapNum,
+        lang,
+        sourceLibrary: 'MangaDex',
+        title: `Глава ${chapNum}${cleanChTitle} ${badge}`.trim(),
+      });
+    }
+  }
+
+  return Array.from(grouped.values()).sort((a, b) => {
+    const na = parseFloat(a.chapterNumber);
+    const nb = parseFloat(b.chapterNumber);
+    if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+    return a.chapterNumber.localeCompare(b.chapterNumber, undefined, { numeric: true });
+  });
+}
+
+async function fetchMangaDexChapterPageUrls(externalChapterId) {
+  const srv = await importFetchJson(
+    `${MANGADEX_IMPORT_API}/at-home/server/${encodeURIComponent(externalChapterId)}`
+  );
+  const baseUrl = srv?.baseUrl;
+  const hash = srv?.chapter?.hash;
+  const dataFiles = Array.isArray(srv?.chapter?.data) ? srv.chapter.data : [];
+  const saverFiles = Array.isArray(srv?.chapter?.dataSaver) ? srv.chapter.dataSaver : [];
+
+  const useSaver = dataFiles.length === 0 && saverFiles.length > 0;
+  const files = useSaver ? saverFiles : dataFiles;
+  const folder = useSaver ? 'data-saver' : 'data';
+
+  if (!baseUrl || !hash || files.length === 0) return [];
+  return files.map((f) => `${baseUrl}/${folder}/${hash}/${f}`);
+}
+
+async function importSingleMangaChaptersToTelegram(dbManga, sourceChapters, maxChapters) {
+  const { rows: existingChapters } = await pool.query(
+    `SELECT chapter_number, title, pages FROM public.chapters WHERE manga_id = $1 ORDER BY chapter_number ASC`,
+    [String(dbManga.id)]
+  );
+
+  const existingKeys = new Set();
+  let maxChapterSeq = 0;
+
+  for (const row of existingChapters) {
+    const seq = Number(row.chapter_number || 0);
+    if (seq > maxChapterSeq) maxChapterSeq = seq;
+
+    const t = String(row.title || '');
+    const langMatch = t.match(/\[(RU|EN)\]/i);
+    const detectedLang = langMatch ? langMatch[1].toLowerCase() : importHasRussian(t) ? 'ru' : 'en';
+    const numMatch = t.match(/Глава\s*([0-9]+(?:\.[0-9]+)?)/i);
+    const numKey = numMatch ? numMatch[1] : String(seq);
+
+    const pagesArr = Array.isArray(row.pages) ? row.pages : [];
+    if (pagesArr.length > 0) {
+      existingKeys.add(`${numKey}__${detectedLang}`);
+      existingKeys.add(t.trim().toLowerCase());
+    }
+  }
+
+  let addedChapters = 0;
+  for (const ch of sourceChapters) {
+    if (addedChapters >= maxChapters) break;
+
+    const dedupKey = `${ch.chapterNumber}__${ch.lang}`;
+    if (existingKeys.has(dedupKey) || existingKeys.has(ch.title.toLowerCase())) {
+      continue;
+    }
+
+    const pageUrls = await fetchMangaDexChapterPageUrls(ch.externalChapterId).catch(() => []);
+    if (pageUrls.length === 0) continue;
+
+    const telegramUrls = [];
+    const pageSources = [];
+    let failed = false;
+
+    for (let i = 0; i < pageUrls.length; i++) {
+      const rawUrl = pageUrls[i];
+      const ext = rawUrl.toLowerCase().includes('.png') ? 'png' : 'jpg';
+      const tgFileName = `${dbManga.id}_ch${ch.chapterNumber}_${ch.lang}_p${i + 1}.${ext}`;
+      try {
+        const tgUrl = await mirrorRemoteImageToTelegramStorage(rawUrl, tgFileName);
+        telegramUrls.push(tgUrl);
+        pageSources.push({
+          url: tgUrl,
+          source: ch.sourceLibrary,
+          lang: ch.lang,
+          pageNumber: i + 1,
+          archivedInTelegram: tgUrl.includes('/api/proxy-image'),
+        });
+      } catch (err) {
+        console.warn(`[AutoImport] Ошибка загрузки стр. ${i + 1} (${ch.title}):`, err.message || err);
+        failed = true;
+        break;
+      }
+      await importSleep(450);
+    }
+
+    if (failed || telegramUrls.length === 0) {
+      continue;
+    }
+
+    maxChapterSeq += 1;
+    try {
+      await pool.query(
+        `INSERT INTO public.chapters (manga_id, chapter_number, title, pages, source_library, page_sources)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb)
+         ON CONFLICT (manga_id, chapter_number)
+         DO UPDATE SET title = EXCLUDED.title, pages = EXCLUDED.pages, source_library = EXCLUDED.source_library, page_sources = EXCLUDED.page_sources`,
+        [
+          String(dbManga.id),
+          maxChapterSeq,
+          ch.title,
+          JSON.stringify(telegramUrls),
+          ch.sourceLibrary,
+          JSON.stringify(pageSources),
+        ]
+      );
+    } catch (_) {
+      await pool.query(
+        `INSERT INTO public.chapters (manga_id, chapter_number, title, pages)
+         VALUES ($1, $2, $3, $4::jsonb)
+         ON CONFLICT (manga_id, chapter_number)
+         DO UPDATE SET title = EXCLUDED.title, pages = EXCLUDED.pages`,
+        [String(dbManga.id), maxChapterSeq, ch.title, JSON.stringify(telegramUrls)]
+      );
+    }
+
+    existingKeys.add(dedupKey);
+    addedChapters += 1;
+    console.log(`[AutoImport] Сохранена в Telegram: "${dbManga.title}" -> ${ch.title} (${telegramUrls.length} стр.)`);
+    await importSleep(1200);
+  }
+
+  if (addedChapters > 0) {
+    await pool
+      .query(
+        `UPDATE public.mangas
+         SET chapters_count = (SELECT COUNT(*)::int FROM public.chapters WHERE manga_id = $1)
+         WHERE id = $1`,
+        [String(dbManga.id)]
+      )
+      .catch(() => {});
+  }
+
+  return addedChapters;
+}
+
+async function runScheduledMangaAutoImport({ query = '', maxTitles = AUTO_IMPORT_TITLES_PER_RUN, maxChapters = AUTO_IMPORT_MAX_CHAPTERS_PER_RUN } = {}) {
+  if (isAutoImportRunning) {
+    return { skipped: true, reason: 'already_running' };
+  }
+  isAutoImportRunning = true;
+  autoImportLastRunAt = new Date().toISOString();
+  const report = {
+    startedAt: autoImportLastRunAt,
+    query: query || 'trending',
+    processedTitles: [],
+    totalAddedChapters: 0,
+  };
+
+  try {
+    await ensureMangaImportSchema();
+    const candidates = await searchMangaOnMangaDex(query, query ? 3 : Math.max(maxTitles * 2, 6));
+    const targets = query ? candidates.slice(0, 1) : candidates.slice(0, maxTitles);
+
+    for (const rawManga of targets) {
+      const meta = normalizeMangaDexMeta(rawManga);
+      const dbManga = await findOrCreateImportedManga(meta);
+      const chapters = await fetchAnalyzedChaptersFromSource(meta.sourceId);
+      const ruCount = chapters.filter((c) => c.lang === 'ru').length;
+      const enCount = chapters.filter((c) => c.lang === 'en').length;
+      const added = await importSingleMangaChaptersToTelegram(dbManga, chapters, maxChapters);
+
+      report.totalAddedChapters += added;
+      report.processedTitles.push({
+        mangaId: dbManga.id,
+        title: dbManga.title,
+        foundChapters: chapters.length,
+        ruChapters: ruCount,
+        enChapters: enCount,
+        addedChapters: added,
+      });
+    }
+  } catch (err) {
+    console.error('[AutoImport] Ошибка фонового импорта:', err.message || err);
+    report.error = err.message || String(err);
+  } finally {
+    report.finishedAt = new Date().toISOString();
+    autoImportLastSummary = report;
+    isAutoImportRunning = false;
+  }
+
+  return report;
+}
+
+// Ручной запуск импорта из админки или по запросу: POST /api/admin/auto-import { "query": "Solo Leveling", "maxChapters": 10 }
+app.post('/api/admin/auto-import', async (req, res) => {
+  try {
+    if (isAutoImportRunning) {
+      return res.status(409).json({
+        success: false,
+        error: 'Автоимпорт уже выполняется в фоне',
+        lastRunAt: autoImportLastRunAt,
+      });
+    }
+    const body = req.body || {};
+    const query = String(body.query || '').trim();
+    const maxTitles = Math.min(10, Math.max(1, Number(body.maxTitles || (query ? 1 : AUTO_IMPORT_TITLES_PER_RUN))));
+    const maxChapters = Math.min(50, Math.max(1, Number(body.maxChapters || AUTO_IMPORT_MAX_CHAPTERS_PER_RUN)));
+
+    if (body.async === true) {
+      runScheduledMangaAutoImport({ query, maxTitles, maxChapters }).catch(() => {});
+      return res.json({
+        success: true,
+        started: true,
+        message: 'Фоновый импорт запущен',
+      });
+    }
+
+    const report = await runScheduledMangaAutoImport({ query, maxTitles, maxChapters });
+    return res.json({ success: true, report });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message || 'Ошибка запуска импорта' });
+  }
+});
+
+// Статус последнего автоимпорта: GET /api/admin/auto-import/status
+app.get('/api/admin/auto-import/status', (_req, res) => {
+  return res.json({
+    success: true,
+    enabled: AUTO_IMPORT_ENABLED,
+    running: isAutoImportRunning,
+    intervalMs: AUTO_IMPORT_INTERVAL_MS,
+    allowedLangs: AUTO_IMPORT_LANGS,
+    lastRunAt: autoImportLastRunAt,
+    lastSummary: autoImportLastSummary,
+  });
+});
+
 // --- JSON 404 для всех неизвестных /api/* маршрутов ---
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
@@ -2551,4 +3144,13 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
+  if (AUTO_IMPORT_ENABLED) {
+    console.log(`[AutoImport] Планировщик активен (интервал: ${Math.round(AUTO_IMPORT_INTERVAL_MS / 60000)} мин., языки: ${AUTO_IMPORT_LANGS.join(', ')})`);
+    setTimeout(() => {
+      runScheduledMangaAutoImport().catch((e) => console.error('[AutoImport] Initial run error:', e));
+    }, AUTO_IMPORT_INITIAL_DELAY_MS);
+    setInterval(() => {
+      runScheduledMangaAutoImport().catch((e) => console.error('[AutoImport] Scheduled run error:', e));
+    }, AUTO_IMPORT_INTERVAL_MS);
+  }
 });
