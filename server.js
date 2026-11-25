@@ -3176,6 +3176,9 @@ function buildPostgrestFilterString(filters) {
 
     if (op === 'eq') {
       parts.push(`${col}=eq.${encodeURIComponent(String(val ?? ''))}`);
+    } else if (op === 'is') {
+      const normIs = val === null || val === undefined ? 'null' : String(val);
+      parts.push(`${col}=is.${encodeURIComponent(normIs)}`);
     } else if (op === 'gt') {
       parts.push(`${col}=gt.${encodeURIComponent(String(val ?? ''))}`);
     } else if (op === 'like') {
