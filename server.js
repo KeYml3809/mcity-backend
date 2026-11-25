@@ -3131,6 +3131,177 @@ app.get('/api/admin/auto-import/status', (_req, res) => {
   });
 });
 
+
+// ============================================================================
+// ПРОКСИ-ШЛЮЗ ДЛЯ ОБРАЩЕНИЯ К ТАБЛИЦАМ SUPABASE ЧЕРЕЗ БЭКЕНД (БЕЗ УТЕЧКИ КЛЮЧЕЙ НА ФРОНТ)
+// ============================================================================
+const SUPABASE_GATEWAY_URL = String(
+  process.env.SUPABASE_URL || 'https://frxftmxdmjttldtrplmh.supabase.co'
+).replace(/\/+$/, '');
+const SUPABASE_GATEWAY_KEY = String(
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZyeGZ0bXhkbWp0dGxkdHJwbG1oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQwNTI0NjksImV4cCI6MjEwOTYyODQ2OX0.bPTHLP1_rETAwjlrlDEX9eX-vyqxfuDAqWy1H1UcTVA'
+).trim();
+
+const ALLOWED_SUPABASE_TABLES = new Set([
+  'profiles',
+  'users',
+  'user_coins',
+  'user_gifts',
+  'avatar_frames',
+  'profile_achievements',
+  'profile_badges',
+  'gift_items',
+  'cards',
+  'mangas',
+  'chapters',
+  'friend_requests',
+  'friends',
+  'messages',
+  'shop_banner',
+  'jester_stage_animations',
+  'manga_comments',
+]);
+
+function buildPostgrestFilterString(filters) {
+  if (!Array.isArray(filters) || filters.length === 0) return '';
+  const parts = [];
+  for (const flt of filters) {
+    if (!flt || !flt.col) continue;
+    const col = String(flt.col).replace(/[^a-zA-Z0-9_.-]/g, '');
+    if (!col) continue;
+    const op = String(flt.op || 'eq').toLowerCase();
+    const val = flt.val;
+
+    if (op === 'eq') {
+      parts.push(`${col}=eq.${encodeURIComponent(String(val ?? ''))}`);
+    } else if (op === 'gt') {
+      parts.push(`${col}=gt.${encodeURIComponent(String(val ?? ''))}`);
+    } else if (op === 'like') {
+      parts.push(`${col}=like.${encodeURIComponent(String(val ?? ''))}`);
+    } else if (op === 'or' && typeof val === 'string' && val.trim()) {
+      parts.push(`or=${encodeURIComponent(val.trim())}`);
+    }
+  }
+  return parts.join('&');
+}
+
+app.post('/api/db/query', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const table = String(body.table || '').trim();
+    const action = String(body.action || 'select').trim().toLowerCase();
+
+    if (!ALLOWED_SUPABASE_TABLES.has(table)) {
+      return res.status(403).json({ data: null, error: { message: 'Table access not allowed' } });
+    }
+    if (!SUPABASE_GATEWAY_URL || !SUPABASE_GATEWAY_KEY) {
+      return res.status(500).json({ data: null, error: { message: 'Supabase credentials not configured on backend' } });
+    }
+
+    const queryParts = [];
+    if (body.select && typeof body.select === 'string') {
+      queryParts.push(`select=${encodeURIComponent(body.select.trim())}`);
+    }
+    const filterStr = buildPostgrestFilterString(body.filters);
+    if (filterStr) queryParts.push(filterStr);
+
+    if (body.order && body.order.col) {
+      const ordCol = String(body.order.col).replace(/[^a-zA-Z0-9_.-]/g, '');
+      const dir = body.order.ascending === false ? 'desc' : 'asc';
+      if (ordCol) queryParts.push(`order=${encodeURIComponent(`${ordCol}.${dir}`)}`);
+    }
+    if (body.limit !== undefined && body.limit !== null) {
+      const lim = Math.max(1, Math.min(500, Number(body.limit) || 100));
+      queryParts.push(`limit=${lim}`);
+    }
+
+    const qs = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
+    const endpoint = `${SUPABASE_GATEWAY_URL}/rest/v1/${encodeURIComponent(table)}${qs}`;
+
+    let httpMethod = 'GET';
+    let requestBody = undefined;
+    const preferTokens = [];
+
+    if (action === 'select') {
+      httpMethod = 'GET';
+      if (body.single || body.maybeSingle) {
+        preferTokens.push('return=representation');
+      }
+    } else if (action === 'insert') {
+      httpMethod = 'POST';
+      requestBody = JSON.stringify(body.payload ?? {});
+      if (body.select) preferTokens.push('return=representation');
+    } else if (action === 'update') {
+      httpMethod = 'PATCH';
+      requestBody = JSON.stringify(body.payload ?? {});
+      if (body.select) preferTokens.push('return=representation');
+    } else if (action === 'upsert') {
+      httpMethod = 'POST';
+      requestBody = JSON.stringify(body.payload ?? {});
+      preferTokens.push('resolution=merge-duplicates');
+      if (body.select) preferTokens.push('return=representation');
+    } else if (action === 'delete') {
+      httpMethod = 'DELETE';
+      if (body.select) preferTokens.push('return=representation');
+    } else {
+      return res.status(400).json({ data: null, error: { message: 'Unsupported action' } });
+    }
+
+    const headers = {
+      'apikey': SUPABASE_GATEWAY_KEY,
+      'Authorization': `Bearer ${SUPABASE_GATEWAY_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    };
+    if (preferTokens.length > 0) {
+      headers['Prefer'] = preferTokens.join(',');
+    }
+    if (body.single) {
+      headers['Accept'] = 'application/vnd.pgrst.object+json';
+    }
+
+    const upstream = await fetch(endpoint, {
+      method: httpMethod,
+      headers,
+      body: requestBody,
+    });
+
+    const rawText = await upstream.text();
+    let parsedJson = null;
+    try {
+      parsedJson = rawText ? JSON.parse(rawText) : null;
+    } catch (_) {
+      parsedJson = rawText;
+    }
+
+    if (!upstream.ok) {
+      // В PostgREST при maybeSingle и отсутствии строк возвращается PGRST116 (406)
+      if (body.maybeSingle && upstream.status === 406) {
+        return res.json({ data: null, error: null });
+      }
+      const errObj =
+        parsedJson && typeof parsedJson === 'object'
+          ? parsedJson
+          : { message: String(parsedJson || `HTTP ${upstream.status}`), code: String(upstream.status) };
+      return res.json({ data: null, error: errObj });
+    }
+
+    if (body.maybeSingle && Array.isArray(parsedJson)) {
+      return res.json({ data: parsedJson[0] || null, error: null });
+    }
+
+    return res.json({ data: parsedJson, error: null });
+  } catch (err) {
+    console.error('POST /api/db/query:', err);
+    return res.json({
+      data: null,
+      error: { message: err.message || 'Backend database gateway error' },
+    });
+  }
+});
+
 // --- JSON 404 для всех неизвестных /api/* маршрутов ---
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
