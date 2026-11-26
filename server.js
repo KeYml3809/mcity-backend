@@ -3042,52 +3042,6 @@ async function importSingleMangaChaptersToTelegram(dbManga, sourceChapters, maxC
 async function runScheduledMangaAutoImport({ query = '', maxTitles = AUTO_IMPORT_TITLES_PER_RUN, maxChapters = AUTO_IMPORT_MAX_CHAPTERS_PER_RUN } = {}) {
   return { disabled: true, reason: 'backend_auto_load_disabled', processedTitles: [], totalAddedChapters: 0 };
 }
-  if (isAutoImportRunning) {
-    return { skipped: true, reason: 'already_running' };
-  }
-  isAutoImportRunning = true;
-  autoImportLastRunAt = new Date().toISOString();
-  const report = {
-    startedAt: autoImportLastRunAt,
-    query: query || 'trending',
-    processedTitles: [],
-    totalAddedChapters: 0,
-  };
-
-  try {
-    await ensureMangaImportSchema();
-    const candidates = await searchMangaOnMangaDex(query, query ? 3 : Math.max(maxTitles * 2, 6));
-    const targets = query ? candidates.slice(0, 1) : candidates.slice(0, maxTitles);
-
-    for (const rawManga of targets) {
-      const meta = normalizeMangaDexMeta(rawManga);
-      const dbManga = await findOrCreateImportedManga(meta);
-      const chapters = await fetchAnalyzedChaptersFromSource(meta.sourceId);
-      const ruCount = chapters.filter((c) => c.lang === 'ru').length;
-      const enCount = chapters.filter((c) => c.lang === 'en').length;
-      const added = await importSingleMangaChaptersToTelegram(dbManga, chapters, maxChapters);
-
-      report.totalAddedChapters += added;
-      report.processedTitles.push({
-        mangaId: dbManga.id,
-        title: dbManga.title,
-        foundChapters: chapters.length,
-        ruChapters: ruCount,
-        enChapters: enCount,
-        addedChapters: added,
-      });
-    }
-  } catch (err) {
-    console.error('[AutoImport] Ошибка фонового импорта:', err.message || err);
-    report.error = err.message || String(err);
-  } finally {
-    report.finishedAt = new Date().toISOString();
-    autoImportLastSummary = report;
-    isAutoImportRunning = false;
-  }
-
-  return report;
-}
 
 // Ручной запуск импорта из админки или по запросу: POST /api/admin/auto-import { "query": "Solo Leveling", "maxChapters": 10 }
 app.post('/api/admin/auto-import', async (req, res) => {
