@@ -2543,7 +2543,7 @@ app.post('/api/admin/set-role', async (req, res) => {
 // АВТОМАТИЧЕСКИЙ ИМПОРТ МАНГИ И ГЛАВ С ИСТОЧНИКОВ В TELEGRAM И БД (Mcity)
 // ============================================================================
 const MANGADEX_IMPORT_API = 'https://api.mangadex.org';
-const AUTO_IMPORT_ENABLED = String(process.env.AUTO_IMPORT_ENABLED || 'true').toLowerCase() !== 'false';
+const AUTO_IMPORT_ENABLED = false; // Автозагрузка страниц/глав на бэкенде отключена
 const AUTO_IMPORT_INTERVAL_MS = Math.max(5 * 60 * 1000, Number(process.env.AUTO_IMPORT_INTERVAL_MS || (60 * 60 * 1000))); // по умолчанию раз в 1 час
 const AUTO_IMPORT_INITIAL_DELAY_MS = Math.max(5000, Number(process.env.AUTO_IMPORT_INITIAL_DELAY_MS || 20000));
 const AUTO_IMPORT_TITLES_PER_RUN = Math.max(1, Number(process.env.AUTO_IMPORT_TITLES_PER_RUN || 3));
@@ -3040,6 +3040,8 @@ async function importSingleMangaChaptersToTelegram(dbManga, sourceChapters, maxC
 }
 
 async function runScheduledMangaAutoImport({ query = '', maxTitles = AUTO_IMPORT_TITLES_PER_RUN, maxChapters = AUTO_IMPORT_MAX_CHAPTERS_PER_RUN } = {}) {
+  return { disabled: true, reason: 'backend_auto_load_disabled', processedTitles: [], totalAddedChapters: 0 };
+}
   if (isAutoImportRunning) {
     return { skipped: true, reason: 'already_running' };
   }
